@@ -122,7 +122,8 @@ float  absMaxStopPercent = input.float(10.0, "Absolute Max Stop %", step=0.1, gr
 float  riskPercent = input.float(0.75, "Risk per Trade % equity", step=0.05, group=GRP_RISK)
 float  maxPositionPercent = input.float(25.0, "Max Position Notional % equity", step=1.0, group=GRP_RISK)
 float  leverage   = input.float(5.0, "Leverage (display / margin note)", step=0.5, group=GRP_RISK)
-float  minRR      = input.float(2.0, "Minimum R:R to TP1", step=0.1, group=GRP_RISK)
+float  minRR      = input.float(2.0, "Minimum R:R to nearest structure", step=0.1, group=GRP_RISK)
+int    rrLookback = input.int(50, "RR structure lookback", minval=10, group=GRP_RISK)
 float  tp1R       = input.float(2.0, "TP1 R-multiple", step=0.1, group=GRP_RISK)
 float  tp2R       = input.float(3.0, "TP2 R-multiple", step=0.1, group=GRP_RISK)
 float  tp1QtyPct  = input.float(40.0, "TP1 close % of position", step=1.0, group=GRP_RISK)
@@ -971,10 +972,12 @@ calculatePositionSize(float entryPx, float stopPx) =>
         qty := 0.0
     qty
 
-calculateRR(float entryPx, float stopPx, float tpPx, bool isLong) =>
+// RR must be measured against structure. Measuring it against a target that is itself
+// defined as tp1R * risk would always return tp1R, making the minRR filter dead code.
+calculateRR(float entryPx, float stopPx, float targetPx, bool isLong) =>
     float risk = math.abs(entryPx - stopPx)
-    float reward = isLong ? tpPx - entryPx : entryPx - tpPx
-    safeDiv(reward, risk)
+    float reward = isLong ? targetPx - entryPx : entryPx - targetPx
+    reward <= 0 ? 0.0 : safeDiv(reward, risk)
 
 // Planned levels using close as proxy for signal-bar decision (entry ≈ next open ≈ close for RR filter)
 float plannedEntry = close
@@ -986,8 +989,14 @@ float plannedLongTP1 = plannedEntry + plannedLongR * tp1R
 float plannedLongTP2 = plannedEntry + plannedLongR * tp2R
 float plannedShortTP1 = plannedEntry - plannedShortR * tp1R
 float plannedShortTP2 = plannedEntry - plannedShortR * tp2R
-float plannedLongRR  = calculateRR(plannedEntry, plannedLongSL, plannedLongTP1, true)
-float plannedShortRR = calculateRR(plannedEntry, plannedShortSL, plannedShortTP1, false)
+
+// Room to the nearest opposing structure; blank overhead means the path is clear
+float overheadResistance = ta.highest(high[1], rrLookback)
+float underlyingSupport  = ta.lowest(low[1], rrLookback)
+bool  clearAboveLong  = overheadResistance <= plannedEntry
+bool  clearBelowShort = underlyingSupport >= plannedEntry
+float plannedLongRR  = clearAboveLong ? tp2R : calculateRR(plannedEntry, plannedLongSL, overheadResistance, true)
+float plannedShortRR = clearBelowShort ? tp2R : calculateRR(plannedEntry, plannedShortSL, underlyingSupport, false)
 float plannedLongQty = calculatePositionSize(plannedEntry, plannedLongSL)
 float plannedShortQty = calculatePositionSize(plannedEntry, plannedShortSL)
 
