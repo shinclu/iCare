@@ -127,8 +127,12 @@ float  tp1R       = input.float(2.0, "TP1 R-multiple", step=0.1, group=GRP_RISK)
 float  tp2R       = input.float(3.0, "TP2 R-multiple", step=0.1, group=GRP_RISK)
 float  tp1QtyPct  = input.float(40.0, "TP1 close % of position", step=1.0, group=GRP_RISK)
 float  tp2QtyPct  = input.float(35.0, "TP2 close % of position", step=1.0, group=GRP_RISK)
-bool   moveBeAt2R = input.bool(true, "Move SL to BE at +2R", group=GRP_RISK)
+bool   moveBeAt2R = input.bool(true, "Move SL to break-even", group=GRP_RISK)
+float  beTriggerR = input.float(1.5, "BE trigger (R)", step=0.1, group=GRP_RISK, tooltip="Kept separate from TP1 so the runner is not immediately squeezed to break-even.")
+float  trailStartR = input.float(2.0, "Trailing start (R)", step=0.1, group=GRP_RISK)
 float  beBufferPct = input.float(0.05, "BE buffer % (fees)", step=0.01, group=GRP_RISK)
+bool   useStructureExit = input.bool(true, "Exit on structure failure", group=GRP_RISK)
+int    structExitMinSignals = input.int(2, "Structure-fail signals required", minval=1, maxval=5, group=GRP_RISK, tooltip="Requires confluence; 1 makes a single opposing VSA bar close the trade.")
 string trailMode  = input.string("ATR", "Trailing Mode", options=["Swing", "EMA21", "ATR", "Chandelier"], group=GRP_RISK)
 float  trailAtrMult = input.float(2.0, "Trailing ATR Mult", step=0.1, group=GRP_RISK)
 int    swingTrailLen = input.int(10, "Swing trail lookback", minval=2, group=GRP_RISK)
@@ -1152,11 +1156,7 @@ var float tp1Price   = na
 var float tp2Price   = na
 var float trailStop  = na
 var float riskR      = na
-var bool  tp1Hit     = false
-var bool  tp2Hit     = false
-var bool  beMoved    = false
 var string activeSetup = ""
-var float entryScore = na
 var float entryQty   = na
 
 // Detect exits for cooldown
@@ -1168,11 +1168,7 @@ if strategy.position_size == 0 and strategy.position_size[1] != 0
     tp2Price := na
     trailStop := na
     riskR := na
-    tp1Hit := false
-    tp2Hit := false
-    beMoved := false
     activeSetup := ""
-    entryScore := na
     entryQty := na
 
 // Entries — strategy enters on next bar because process_orders_on_close=true
@@ -1188,11 +1184,7 @@ if longSignal
     tp1Price := plannedLongTP1
     tp2Price := plannedLongTP2
     trailStop := sl
-    tp1Hit := false
-    tp2Hit := false
-    beMoved := false
     activeSetup := buySetup
-    entryScore := buyScore
     entryQty := qty
     lastLongEntryBar := bar_index
 
@@ -1207,11 +1199,7 @@ if shortSignal
     tp1Price := plannedShortTP1
     tp2Price := plannedShortTP2
     trailStop := sl
-    tp1Hit := false
-    tp2Hit := false
-    beMoved := false
     activeSetup := sellSetup
-    entryScore := sellScore
     entryQty := qty
     lastShortEntryBar := bar_index
 
@@ -1233,31 +1221,65 @@ float swingTrailHigh = ta.highest(high, swingTrailLen)
 float chandelierLong  = swingTrailHigh - atr * trailAtrMult
 float chandelierShort = swingTrailLow + atr * trailAtrMult
 
+// Best excursion since entry drives break-even and trailing activation.
+// Using the recorded extreme instead of the current bar keeps the ratchet monotonic.
+var float maxFavor = na
+var float initQty  = na
+
+if strategy.position_size == 0
+    maxFavor := na
+    initQty := na
+else if strategy.position_size[1] == 0
+    initQty := math.abs(strategy.position_size)
+    maxFavor := strategy.position_size > 0 ? high : low
+else if strategy.position_size > 0
+    maxFavor := math.max(nz(maxFavor, high), high)
+else
+    maxFavor := math.min(nz(maxFavor, low), low)
+
+// Count opposing evidence; a single bearish bar is not enough to abandon a long
+longStructFailCount() =>
+    int c = 0
+    if sow
+        c += 1
+    if failedBreakout
+        c += 1
+    if ema9 < ema21 and ema21 < ema50 and close < ema50
+        c += 1
+    if htfRegime == "STRONG_BEAR"
+        c += 1
+    if not na(pivotLow) and close < pivotLow and rVol >= volMult
+        c += 1
+    c
+
+shortStructFailCount() =>
+    int c = 0
+    if sos
+        c += 1
+    if failedBreakdown
+        c += 1
+    if ema9 > ema21 and ema21 > ema50 and close > ema50
+        c += 1
+    if htfRegime == "STRONG_BULL"
+        c += 1
+    if not na(pivotHigh) and close > pivotHigh and rVol >= volMult
+        c += 1
+    c
+
+int longFailSignals  = longStructFailCount()
+int shortFailSignals = shortStructFailCount()
+
 manageLong() =>
     float newTrail = trailStop
     float newStop = stopPrice
-    bool newTp1 = tp1Hit
-    bool newTp2 = tp2Hit
-    bool newBe = beMoved
 
     if strategy.position_size > 0 and not na(entryPrice) and not na(riskR) and riskR > 0
-        // Partial TP1
-        if not tp1Hit and high >= tp1Price
-            strategy.close("Long", qty_percent=tp1QtyPct, comment="TP1")
-            newTp1 := true
-        // Partial TP2
-        if tp1Hit and not tp2Hit and high >= tp2Price
-            float remPct = 100.0 - tp1QtyPct
-            float tp2OfRem = remPct > 0 ? (tp2QtyPct / remPct) * 100.0 : 100.0
-            strategy.close("Long", qty_percent=math.min(tp2OfRem, 100.0), comment="TP2")
-            newTp2 := true
-        // Move BE at +2R
-        if moveBeAt2R and not beMoved and high >= entryPrice + riskR * 2.0
-            newStop := entryPrice * (1.0 + beBufferPct / 100.0)
-            newBe := true
-            newTrail := math.max(nz(newTrail), newStop)
-        // Trailing after TP1 or +2R
-        bool trailOn = tp1Hit or high >= entryPrice + riskR * 2.0
+        // Break-even and trailing activate off recorded excursion, not the live bar
+        bool beReached = moveBeAt2R and nz(maxFavor, high) >= entryPrice + riskR * beTriggerR
+        bool trailOn   = nz(maxFavor, high) >= entryPrice + riskR * trailStartR
+
+        if beReached
+            newStop := math.max(newStop, entryPrice * (1.0 + beBufferPct / 100.0))
         if trailOn
             float cand = newStop
             if trailMode == "ATR"
@@ -1270,40 +1292,31 @@ manageLong() =>
                 cand := chandelierLong
             newTrail := math.max(nz(newTrail, cand), cand, newStop)
             newStop := newTrail
-        // Hard SL
-        strategy.exit("Long SL", from_entry="Long", stop=newStop, comment="SL/Trail")
-        // Structure failure exits
-        bool structFail =
-             sow or
-             failedBreakout or
-             (ema9 < ema21 and ema21 < ema50 and close < ema50) or
-             htfRegime == "STRONG_BEAR" or
-             (not na(pivotLow) and close < pivotLow and rVol >= volMult)
-        if structFail and signalBar
+
+        // Bracket exits: TP fills at the limit price intrabar rather than at bar close
+        float q1 = nz(initQty) * tp1QtyPct / 100.0
+        float q2 = nz(initQty) * tp2QtyPct / 100.0
+        if q1 > 0
+            strategy.exit("L-TP1", from_entry="Long", qty=q1, limit=tp1Price, comment="TP1")
+        if q2 > 0
+            strategy.exit("L-TP2", from_entry="Long", qty=q2, limit=tp2Price, comment="TP2")
+        // Runner order carries the stop for whatever size remains
+        strategy.exit("L-RUN", from_entry="Long", stop=newStop, comment="SL/Trail")
+
+        if useStructureExit and longFailSignals >= structExitMinSignals and signalBar
             strategy.close("Long", comment="Structure Fail")
-    [newStop, newTrail, newTp1, newTp2, newBe]
+    [newStop, newTrail]
 
 manageShort() =>
     float newTrail = trailStop
     float newStop = stopPrice
-    bool newTp1 = tp1Hit
-    bool newTp2 = tp2Hit
-    bool newBe = beMoved
 
     if strategy.position_size < 0 and not na(entryPrice) and not na(riskR) and riskR > 0
-        if not tp1Hit and low <= tp1Price
-            strategy.close("Short", qty_percent=tp1QtyPct, comment="TP1")
-            newTp1 := true
-        if tp1Hit and not tp2Hit and low <= tp2Price
-            float remPct = 100.0 - tp1QtyPct
-            float tp2OfRem = remPct > 0 ? (tp2QtyPct / remPct) * 100.0 : 100.0
-            strategy.close("Short", qty_percent=math.min(tp2OfRem, 100.0), comment="TP2")
-            newTp2 := true
-        if moveBeAt2R and not beMoved and low <= entryPrice - riskR * 2.0
-            newStop := entryPrice * (1.0 - beBufferPct / 100.0)
-            newBe := true
-            newTrail := math.min(nz(newTrail, newStop), newStop)
-        bool trailOn = tp1Hit or low <= entryPrice - riskR * 2.0
+        bool beReached = moveBeAt2R and nz(maxFavor, low) <= entryPrice - riskR * beTriggerR
+        bool trailOn   = nz(maxFavor, low) <= entryPrice - riskR * trailStartR
+
+        if beReached
+            newStop := math.min(newStop, entryPrice * (1.0 - beBufferPct / 100.0))
         if trailOn
             float cand = newStop
             if trailMode == "ATR"
@@ -1316,33 +1329,30 @@ manageShort() =>
                 cand := chandelierShort
             newTrail := math.min(nz(newTrail, cand), cand, newStop)
             newStop := newTrail
-        strategy.exit("Short SL", from_entry="Short", stop=newStop, comment="SL/Trail")
-        bool structFail =
-             sos or
-             failedBreakdown or
-             (ema9 > ema21 and ema21 > ema50 and close > ema50) or
-             htfRegime == "STRONG_BULL" or
-             (not na(pivotHigh) and close > pivotHigh and rVol >= volMult)
-        if structFail and signalBar
+
+        float q1 = nz(initQty) * tp1QtyPct / 100.0
+        float q2 = nz(initQty) * tp2QtyPct / 100.0
+        if q1 > 0
+            strategy.exit("S-TP1", from_entry="Short", qty=q1, limit=tp1Price, comment="TP1")
+        if q2 > 0
+            strategy.exit("S-TP2", from_entry="Short", qty=q2, limit=tp2Price, comment="TP2")
+        // Runner order carries the stop for whatever size remains
+        strategy.exit("S-RUN", from_entry="Short", stop=newStop, comment="SL/Trail")
+
+        if useStructureExit and shortFailSignals >= structExitMinSignals and signalBar
             strategy.close("Short", comment="Structure Fail")
-    [newStop, newTrail, newTp1, newTp2, newBe]
+    [newStop, newTrail]
 
 // Both managers run every bar and no-op when flat, so history stays consistent (CE10002)
-[lStop, lTrail, lTp1, lTp2, lBe] = manageLong()
-[sStop, sTrail, sTp1, sTp2, sBe] = manageShort()
+[lStop, lTrail] = manageLong()
+[sStop, sTrail] = manageShort()
 
 if strategy.position_size > 0
     stopPrice := lStop
     trailStop := lTrail
-    tp1Hit := lTp1
-    tp2Hit := lTp2
-    beMoved := lBe
 else if strategy.position_size < 0
     stopPrice := sStop
     trailStop := sTrail
-    tp1Hit := sTp1
-    tp2Hit := sTp2
-    beMoved := sBe
 
 // Exit alerts
 bool exitLongSignal  = strategy.position_size[1] > 0 and strategy.position_size == 0
