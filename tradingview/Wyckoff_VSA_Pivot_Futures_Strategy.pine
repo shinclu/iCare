@@ -87,6 +87,7 @@ float  maxClosePosBear = input.float(0.30, "Max Close Position (Bear)", step=0.0
 float  noSupplySpreadMult = input.float(0.8, "No Supply max spread vs avg", step=0.05, group=GRP_VSA)
 float  springWickRatio = input.float(0.35, "Spring lower wick / spread", step=0.05, group=GRP_VSA)
 float  springClosePos = input.float(0.55, "Spring min close position", step=0.05, group=GRP_VSA)
+float  locationProxAtr = input.float(0.5, "Support/resistance proximity (ATR)", step=0.1, group=GRP_VSA, tooltip="How close price must be to a pivot or EMA50 for a VSA bar to count as being at a meaningful location.")
 
 // --- Pivot / Retest / Pullback ---
 string GRP_PIV    = "Pivot / Retest / Pullback"
@@ -151,10 +152,12 @@ string benchmarkSym = input.symbol("BINANCE:BTCUSDT.P", "Benchmark Symbol", grou
 
 // --- Anti-whipsaw ---
 string GRP_ANTI   = "Anti-Whipsaw"
-float  minAdxEntry = input.float(15.0, "Min ADX to enter", step=0.5, group=GRP_ANTI)
+float  minAdxEntry = input.float(20.0, "Min ADX to enter", step=0.5, group=GRP_ANTI)
 float  minAtrPctEntry = input.float(0.0015, "Min ATR% to enter", step=0.0001, group=GRP_ANTI)
 float  minBbWidthEntry = input.float(0.008, "Min BB Width to enter", step=0.001, group=GRP_ANTI)
-float  minRvolEntry = input.float(0.7, "Min relative volume to enter", step=0.1, group=GRP_ANTI)
+float  minRvolEntry = input.float(1.0, "Min relative volume to enter", step=0.1, group=GRP_ANTI)
+bool   blockSidewayEntries = input.bool(true, "Block entries in SIDEWAY regime", group=GRP_ANTI)
+float  minScoreGap = input.float(15.0, "Min score gap vs opposite side", step=1.0, group=GRP_ANTI, tooltip="When both directions score similarly the market is ambiguous; require one side to dominate.")
 
 // --- Visualization ---
 string GRP_VIZ    = "Visualization"
@@ -257,8 +260,10 @@ float swingLow  = ta.lowest(low[1], structureLookback)
 float prevSwingHigh = ta.highest(high[1 + structureLookback], structureLookback)
 float prevSwingLow  = ta.lowest(low[1 + structureLookback], structureLookback)
 
-bool hhhl = swingHigh >= prevSwingHigh and swingLow >= prevSwingLow
-bool lhll = swingHigh <= prevSwingHigh and swingLow <= prevSwingLow
+// Strict comparisons: with >= / <= a flat range satisfies both at once and the
+// structure component would award bull and bear points on the same bar
+bool hhhl = swingHigh > prevSwingHigh and swingLow > prevSwingLow
+bool lhll = swingHigh < prevSwingHigh and swingLow < prevSwingLow
 
 bool ema21Rising  = ema21 > ema21[3]
 bool ema50Rising  = ema50 > ema50[5]
@@ -300,8 +305,8 @@ htfBundle() =>
     float hSl = ta.lowest(low[2], structureLookback)
     float hPsh = ta.highest(high[2 + structureLookback], structureLookback)
     float hPsl = ta.lowest(low[2 + structureLookback], structureLookback)
-    bool hHhhl = hSh >= hPsh and hSl >= hPsl
-    bool hLhll = hSh <= hPsh and hSl <= hPsl
+    bool hHhhl = hSh > hPsh and hSl > hPsl
+    bool hLhll = hSh < hPsh and hSl < hPsl
     int bullSc = getTrendScore(c1, hE21, hE50, hE200, hE21Rising, hE50Rising, hE21Falling, hE50Falling, hHhhl, hLhll, true)
     int bearSc = getTrendScore(c1, hE21, hE50, hE200, hE21Rising, hE50Rising, hE21Falling, hE50Falling, hHhhl, hLhll, false)
     [c1, hE21, hE50, hE200, hAtrPct, hAdx, hBbW, bullSc, bearSc, hHhhl, hLhll]
@@ -370,8 +375,10 @@ bool volExtreme    = rVol >= extremeVol
 float pivotHigh = ta.highest(high[1], pivotLookback)  // ANTI-LOOKAHEAD: exclude current bar
 float pivotLow  = ta.lowest(low[1], pivotLookback)
 
-bool nearSupport = low <= pivotLow + atr * 0.5 or low <= ema50 + atr * 0.3
-bool nearResist  = high >= pivotHigh - atr * 0.5 or high >= ema50 - atr * 0.3
+// Proximity must be two-sided. "low <= ema50 + buffer" is true for every bar under
+// the EMA, which made the location weighting fire almost always and defeated its purpose.
+bool nearSupport = math.abs(low - pivotLow) <= atr * locationProxAtr or math.abs(low - ema50) <= atr * locationProxAtr
+bool nearResist  = math.abs(high - pivotHigh) <= atr * locationProxAtr or math.abs(high - ema50) <= atr * locationProxAtr
 bool breakoutLoc = close > pivotHigh
 bool breakdownLoc = close < pivotLow
 
@@ -637,21 +644,26 @@ if strongBreakdown or weakBreakdown
         lastBreakdownVol := volume
         lastBreakdownWeak := weakBreakdown
 
+// Confirmation must be a real demand bar. Accepting any green candle made almost
+// every touch of the level qualify as a retest.
 detectRetestLong() =>
     bool inWin = not na(lastBreakoutBar) and (bar_index - lastBreakoutBar) >= 1 and (bar_index - lastBreakoutBar) <= retestWindow
     float tol = atr * retestTolAtr
     bool touch = inWin and not na(lastBreakoutLevel) and low <= lastBreakoutLevel + tol and close > lastBreakoutLevel
     bool volPull = not na(lastBreakoutVol) and volume < lastBreakoutVol
-    bool conf = isBullCandle or noSupply or sos or (close > open and closePosition >= 0.6)
-    touch and volPull and conf
+    bool conf = sos or noSupply or (isBullCandle and closePosition >= minClosePosBull and bodyRatio >= minBodyRatio)
+    // A retest only rehabilitates a low-volume breakout if this bar brings the volume
+    bool originOk = not lastBreakoutWeak or rVol >= volMult
+    touch and volPull and conf and originOk
 
 detectRetestShort() =>
     bool inWin = not na(lastBreakdownBar) and (bar_index - lastBreakdownBar) >= 1 and (bar_index - lastBreakdownBar) <= retestWindow
     float tol = atr * retestTolAtr
     bool touch = inWin and not na(lastBreakdownLevel) and high >= lastBreakdownLevel - tol and close < lastBreakdownLevel
     bool volPull = not na(lastBreakdownVol) and volume < lastBreakdownVol
-    bool conf = isBearCandle or noDemand or sow or (close < open and closePosition <= 0.4)
-    touch and volPull and conf
+    bool conf = sow or noDemand or (isBearCandle and closePosition <= maxClosePosBear and bodyRatio >= minBodyRatio)
+    bool originOk = not lastBreakdownWeak or rVol >= volMult
+    touch and volPull and conf and originOk
 
 bool retestLong  = detectRetestLong()
 bool retestShort = detectRetestShort()
@@ -905,8 +917,9 @@ getGrade(float score, string setup, bool isLong) =>
     string g = "C"
     int strongTh = isLong ? strongBuyScore : strongSellScore
     int minTh = isLong ? minBuyScore : minSellScore
-    bool core = setup == "PIVOT_BREAKOUT" or setup == "PIVOT_BREAKDOWN" or setup == "RETEST" or setup == "SPRING_TEST" or setup == "UPTHRUST" or setup == "FAILED_BREAKOUT"
-    bool aSetup = setup == "PULLBACK" or setup == "SPRING"
+    // FAILED_BREAKOUT is reactive rather than a planned entry, so it does not earn S grade
+    bool core = setup == "PIVOT_BREAKOUT" or setup == "PIVOT_BREAKDOWN" or setup == "RETEST" or setup == "SPRING_TEST" or setup == "UPTHRUST"
+    bool aSetup = setup == "PULLBACK" or setup == "SPRING" or setup == "FAILED_BREAKOUT"
     bool bSetup = setup == "POCKET_PIVOT"
     if score >= strongTh and core and (isLong ? htfBullish : htfBearish) and (isLong ? sos or springTest : sow or upthrust)
         g := "S+"
@@ -1068,6 +1081,12 @@ else if plannedLongQty <= 0
 else if not antiWhipsawOk
     longHardPass := false
     noBuyReason := "NO BUY: Anti-whipsaw filter"
+else if blockSidewayEntries and marketRegime == "SIDEWAY"
+    longHardPass := false
+    noBuyReason := "NO BUY: Sideway regime"
+else if buyScore - sellScore < minScoreGap
+    longHardPass := false
+    noBuyReason := "NO BUY: Direction ambiguous"
 else if wyckoffDistScore >= distScoreMin + 2
     longHardPass := false
     noBuyReason := "NO BUY: Distribution score high"
@@ -1125,6 +1144,12 @@ else if plannedShortQty <= 0
 else if not antiWhipsawOk
     shortHardPass := false
     noSellReason := "NO SELL: Anti-whipsaw filter"
+else if blockSidewayEntries and marketRegime == "SIDEWAY"
+    shortHardPass := false
+    noSellReason := "NO SELL: Sideway regime"
+else if sellScore - buyScore < minScoreGap
+    shortHardPass := false
+    noSellReason := "NO SELL: Direction ambiguous"
 else if wyckoffAccumScore >= accumScoreMin + 2
     shortHardPass := false
     noSellReason := "NO SELL: Accumulation score high"
