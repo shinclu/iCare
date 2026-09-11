@@ -9,6 +9,11 @@ TradingView strategy for Binance Futures USDT-M Perpetual backtests.
 1. Open TradingView → Pine Editor → paste the `.pine` file → Add to chart.
 2. Chart timeframe: **5 minutes** (primary).
 3. Input **Higher Timeframe** = `60` (1 hour).
+   - If the chart timeframe is already at or above this, `request.security` would return the
+     chart's own series and every HTF gate would pass trivially. **Min HTF multiple of chart TF**
+     (default `4`) escalates the request instead. The dashboard's `HTF Trend (…)` row shows the
+     effective timeframe in minutes, so check it there rather than assuming the input is in force.
+     On a 1H chart this is the difference between profit factor 0.27 and 0.81.
 4. Symbol: e.g. `BTCUSDT.P`, `ETHUSDT.P` on Binance Futures.
 5. Strategy Tester: commission **0.04%** and slippage **2 ticks** (script defaults).
 6. Keep **Confirmed bar signals** ON (default) — no repaint / no lookahead.
