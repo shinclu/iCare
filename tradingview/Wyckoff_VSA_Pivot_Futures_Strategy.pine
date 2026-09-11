@@ -196,7 +196,7 @@ float volSma = ta.sma(volume, volMaLen)
 float rVol   = safeDiv(volume, volSma)
 float avgSpread = ta.sma(high - low, volMaLen)
 
-// CMF computed manually — Pine v6 has no ta.cmf builtin
+// Chaikin Money Flow computed manually (no builtin available in Pine v6)
 float mfMultiplier = safeDiv((close - low) - (high - close), high - low)
 float mfVolume = mfMultiplier * volume
 float cmf = safeDiv(math.sum(mfVolume, cmfLen), math.sum(volume, cmfLen))
