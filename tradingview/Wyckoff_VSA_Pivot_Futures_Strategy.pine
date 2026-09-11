@@ -10,7 +10,7 @@
 
 strategy(
      title              = "Wyckoff VSA Pivot Futures Strategy",
-     shorttitle         = "WVP-Futures",
+     shorttitle         = "WVP",
      overlay            = true,
      pyramiding         = 0,
      initial_capital    = 10000,
@@ -169,15 +169,6 @@ bool   debugMode  = input.bool(false, "Debug Mode", group=GRP_VIZ)
 safeDiv(float a, float b) =>
     b == 0.0 or na(b) ? 0.0 : a / b
 
-f_slope(float src, int len) =>
-    src - src[len]
-
-f_emaSlopePositive(float emaSrc, int look) =>
-    emaSrc > emaSrc[look]
-
-f_emaSlopeNegative(float emaSrc, int look) =>
-    emaSrc < emaSrc[look]
-
 // Confirmed signal gate
 bool signalBar = useConfirmed ? barstate.isconfirmed : true
 
@@ -205,10 +196,16 @@ float volSma = ta.sma(volume, volMaLen)
 float rVol   = safeDiv(volume, volSma)
 float avgSpread = ta.sma(high - low, volMaLen)
 
-// CMF
-float cmf = ta.cmf(cmfLen)
-float mfi = useMfiBonus ? ta.mfi(hlc3, mfiLen) : na
-float obv = useObvBonus ? ta.obv : na
+// CMF computed manually — Pine v6 has no ta.cmf builtin
+float mfMultiplier = safeDiv((close - low) - (high - close), high - low)
+float mfVolume = mfMultiplier * volume
+float cmf = safeDiv(math.sum(mfVolume, cmfLen), math.sum(volume, cmfLen))
+
+// CE10002: history-dependent calls must run every bar, never inside a conditional
+float mfiVal = ta.mfi(hlc3, mfiLen)
+float obvVal = ta.obv
+bool  obvRising = obvVal > obvVal[5]
+bool  obvFalling = obvVal < obvVal[5]
 
 // VSA candle metrics — never divide by zero
 float spread = high - low
@@ -222,16 +219,17 @@ float closePosition = spread > 0 ? safeDiv(close - low, spread) : 0.5
 // 4. TREND / STRUCTURE SCORES (LTF)
 // =============================================================================
 
-getTrendScore(float c, float e21, float e50, float e200, bool hhhl, bool lhll, bool bullBias) =>
+// Slope flags are precomputed by callers so no history lookup happens inside a branch
+getTrendScore(float c, float e21, float e50, float e200, bool e21Rising, bool e50Rising, bool e21Falling, bool e50Falling, bool hhhl, bool lhll, bool bullBias) =>
     int score = 0
     if bullBias
         if c > e200
             score += 2
         if e50 > e200
             score += 2
-        if e21 > e50 or f_emaSlopePositive(e21, 3)
+        if e21 > e50 or e21Rising
             score += 1
-        if f_emaSlopePositive(e50, 5)
+        if e50Rising
             score += 1
         if hhhl
             score += 2
@@ -240,9 +238,9 @@ getTrendScore(float c, float e21, float e50, float e200, bool hhhl, bool lhll, b
             score += 2
         if e50 < e200
             score += 2
-        if e21 < e50 or f_emaSlopeNegative(e21, 3)
+        if e21 < e50 or e21Falling
             score += 1
-        if f_emaSlopeNegative(e50, 5)
+        if e50Falling
             score += 1
         if lhll
             score += 2
@@ -257,8 +255,13 @@ float prevSwingLow  = ta.lowest(low[1 + structureLookback], structureLookback)
 bool hhhl = swingHigh >= prevSwingHigh and swingLow >= prevSwingLow
 bool lhll = swingHigh <= prevSwingHigh and swingLow <= prevSwingLow
 
-int ltfBullScore = getTrendScore(close, ema21, ema50, ema200, hhhl, lhll, true)
-int ltfBearScore = getTrendScore(close, ema21, ema50, ema200, hhhl, lhll, false)
+bool ema21Rising  = ema21 > ema21[3]
+bool ema50Rising  = ema50 > ema50[5]
+bool ema21Falling = ema21 < ema21[3]
+bool ema50Falling = ema50 < ema50[5]
+
+int ltfBullScore = getTrendScore(close, ema21, ema50, ema200, ema21Rising, ema50Rising, ema21Falling, ema50Falling, hhhl, lhll, true)
+int ltfBearScore = getTrendScore(close, ema21, ema50, ema200, ema21Rising, ema50Rising, ema21Falling, ema50Falling, hhhl, lhll, false)
 bool ltfBullish  = ltfBullScore >= htfBullScoreMin
 bool ltfBearish  = ltfBearScore >= htfBearScoreMin
 bool emaBullAlign = ema9 > ema21 and ema21 > ema50 and ema50 > ema200
@@ -272,12 +275,19 @@ bool emaBearAlign = ema9 < ema21 and ema21 < ema50 and ema50 < ema200
 // HTF metrics on the PREVIOUS completed HTF bar (close[1] inside security = no lookahead)
 htfBundle() =>
     float c1 = close[1]
-    float hE21 = ta.ema(close, emaSlowLen)[1]
-    float hE50 = ta.ema(close, emaTrendLen)[1]
-    float hE200 = ta.ema(close, emaLongLen)[1]
+    float e21s = ta.ema(close, emaSlowLen)
+    float e50s = ta.ema(close, emaTrendLen)
+    float e200s = ta.ema(close, emaLongLen)
+    float hE21 = e21s[1]
+    float hE50 = e50s[1]
+    float hE200 = e200s[1]
+    bool hE21Rising  = e21s[1] > e21s[4]
+    bool hE50Rising  = e50s[1] > e50s[6]
+    bool hE21Falling = e21s[1] < e21s[4]
+    bool hE50Falling = e50s[1] < e50s[6]
     float hAtr = ta.atr(atrLen)[1]
     float hAtrPct = safeDiv(hAtr, c1)
-    [_, _, hAdxRaw] = ta.dmi(adxLen, adxLen)
+    [hDiPlus, hDiMinus, hAdxRaw] = ta.dmi(adxLen, adxLen)
     float hAdx = hAdxRaw[1]
     [hMid, hUp, hLo] = ta.bb(close, bbLen, bbMult)
     float hBbW = safeDiv(hUp[1] - hLo[1], hMid[1])
@@ -287,8 +297,8 @@ htfBundle() =>
     float hPsl = ta.lowest(low[2 + structureLookback], structureLookback)
     bool hHhhl = hSh >= hPsh and hSl >= hPsl
     bool hLhll = hSh <= hPsh and hSl <= hPsl
-    int bullSc = getTrendScore(c1, hE21, hE50, hE200, hHhhl, hLhll, true)
-    int bearSc = getTrendScore(c1, hE21, hE50, hE200, hHhhl, hLhll, false)
+    int bullSc = getTrendScore(c1, hE21, hE50, hE200, hE21Rising, hE50Rising, hE21Falling, hE50Falling, hHhhl, hLhll, true)
+    int bearSc = getTrendScore(c1, hE21, hE50, hE200, hE21Rising, hE50Rising, hE21Falling, hE50Falling, hHhhl, hLhll, false)
     [c1, hE21, hE50, hE200, hAtrPct, hAdx, hBbW, bullSc, bearSc, hHhhl, hLhll]
 
 // ANTI-REPAINT: lookahead_off; HTF series already uses [1] completed bar inside bundle
@@ -500,17 +510,22 @@ bool tradingRange = rangeWidth > 0 and rangeWidth <= atr * rangeAtrMax
 int wycHalf = math.max(2, int(wyckoffLookback / 2))
 float atrNow = atr
 float atrPast = atr[wycHalf]
-bool volContraction = atrNow < atrPast and bbWidth < bbWidth[wycHalf]
+float bbWidthPast = bbWidth[wycHalf]
+bool volContraction = atrNow < atrPast and bbWidth < bbWidthPast
 
 float volAvgRecent = ta.sma(volume, wycHalf)
 float volAvgPrior  = ta.sma(volume[wycHalf], wycHalf)
 bool volumeDryUp = volAvgRecent < volAvgPrior * 0.85
 
 // Selling climax / absorption proxy near range low
-bool scProxy = ta.lowest(low, 5) <= rangeLow + atr * 0.1 and ta.highest(rVol, 5) >= strongVol and (sellingClimax or absorptionBull or close > open)
+// ta.* hoisted out of the and-chain: short-circuiting them breaks history consistency
+float low5 = ta.lowest(low, 5)
+float maxRVol5 = ta.highest(rVol, 5)
+bool scProxy = low5 <= rangeLow + atr * 0.1 and maxRVol5 >= strongVol and (sellingClimax or absorptionBull or close > open)
 
 // Automatic rally proxy
-bool arProxy = tradingRange and close > ta.sma(close, wyckoffLookback) and isBullCandle
+float wyckoffMidline = ta.sma(close, wyckoffLookback)
+bool arProxy = tradingRange and close > wyckoffMidline and isBullCandle
 
 detectWyckoffAccumulation() =>
     int sc = 0
@@ -560,7 +575,9 @@ string wyckoffState = isAccumulation and not isDistribution ? "ACCUMULATION" : i
 // VCP / consolidation proxy
 float swingRangeNow = ta.highest(high, 10) - ta.lowest(low, 10)
 float swingRangePrev = ta.highest(high[10], 10) - ta.lowest(low[10], 10)
-bool vcpContract = swingRangeNow < swingRangePrev and atr < atr[10] and bbWidth < bbWidth[10] and volumeDryUp
+float atr10 = atr[10]
+float bbWidth10 = bbWidth[10]
+bool vcpContract = swingRangeNow < swingRangePrev and atr < atr10 and bbWidth < bbWidth10 and volumeDryUp
 int vcpScore = vcpContract ? 2 : 0
 if vcpContract and rVol >= volMult and breakoutLoc
     vcpScore += 3
@@ -723,9 +740,9 @@ if macdHist > 0 and macdLine > macdSignal
     momBuyBonus += 2.0
 if cmf > 0
     momBuyBonus += 1.0
-if useMfiBonus and not na(mfi) and mfi > 50
+if useMfiBonus and not na(mfiVal) and mfiVal > 50
     momBuyBonus += 1.0
-if useObvBonus and not na(obv) and obv > obv[5]
+if useObvBonus and obvRising
     momBuyBonus += 1.0
 if rsBull
     momBuyBonus += 3.0
@@ -737,9 +754,9 @@ if macdHist < 0 and macdLine < macdSignal
     momSellBonus += 2.0
 if cmf < 0
     momSellBonus += 1.0
-if useMfiBonus and not na(mfi) and mfi < 50
+if useMfiBonus and not na(mfiVal) and mfiVal < 50
     momSellBonus += 1.0
-if useObvBonus and not na(obv) and obv < obv[5]
+if useObvBonus and obvFalling
     momSellBonus += 1.0
 if rsBear
     momSellBonus += 3.0
@@ -1210,6 +1227,12 @@ if strategy.position_size < 0 and strategy.position_size[1] >= 0
     tp1Price := entryPrice - riskR * tp1R
     tp2Price := entryPrice - riskR * tp2R
 
+// Trailing candidates evaluated every bar (CE10002) and selected inside the manage functions
+float swingTrailLow  = ta.lowest(low, swingTrailLen)
+float swingTrailHigh = ta.highest(high, swingTrailLen)
+float chandelierLong  = swingTrailHigh - atr * trailAtrMult
+float chandelierShort = swingTrailLow + atr * trailAtrMult
+
 manageLong() =>
     float newTrail = trailStop
     float newStop = stopPrice
@@ -1242,9 +1265,9 @@ manageLong() =>
             else if trailMode == "EMA21"
                 cand := ema21
             else if trailMode == "Swing"
-                cand := ta.lowest(low, swingTrailLen)
+                cand := swingTrailLow
             else  // Chandelier
-                cand := ta.highest(high, swingTrailLen) - atr * trailAtrMult
+                cand := chandelierLong
             newTrail := math.max(nz(newTrail, cand), cand, newStop)
             newStop := newTrail
         // Hard SL
@@ -1288,9 +1311,9 @@ manageShort() =>
             else if trailMode == "EMA21"
                 cand := ema21
             else if trailMode == "Swing"
-                cand := ta.highest(high, swingTrailLen)
+                cand := swingTrailHigh
             else
-                cand := ta.lowest(low, swingTrailLen) + atr * trailAtrMult
+                cand := chandelierShort
             newTrail := math.min(nz(newTrail, cand), cand, newStop)
             newStop := newTrail
         strategy.exit("Short SL", from_entry="Short", stop=newStop, comment="SL/Trail")
@@ -1304,21 +1327,22 @@ manageShort() =>
             strategy.close("Short", comment="Structure Fail")
     [newStop, newTrail, newTp1, newTp2, newBe]
 
-if strategy.position_size > 0
-    [ns, nt, n1, n2, nb] = manageLong()
-    stopPrice := ns
-    trailStop := nt
-    tp1Hit := n1
-    tp2Hit := n2
-    beMoved := nb
+// Both managers run every bar and no-op when flat, so history stays consistent (CE10002)
+[lStop, lTrail, lTp1, lTp2, lBe] = manageLong()
+[sStop, sTrail, sTp1, sTp2, sBe] = manageShort()
 
-if strategy.position_size < 0
-    [ns, nt, n1, n2, nb] = manageShort()
-    stopPrice := ns
-    trailStop := nt
-    tp1Hit := n1
-    tp2Hit := n2
-    beMoved := nb
+if strategy.position_size > 0
+    stopPrice := lStop
+    trailStop := lTrail
+    tp1Hit := lTp1
+    tp2Hit := lTp2
+    beMoved := lBe
+else if strategy.position_size < 0
+    stopPrice := sStop
+    trailStop := sTrail
+    tp1Hit := sTp1
+    tp2Hit := sTp2
+    beMoved := sBe
 
 // Exit alerts
 bool exitLongSignal  = strategy.position_size[1] > 0 and strategy.position_size == 0
