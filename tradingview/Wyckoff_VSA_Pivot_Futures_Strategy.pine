@@ -103,7 +103,7 @@ string GRP_WYC    = "Wyckoff Proxy"
 int    wyckoffLookback = input.int(40, "Wyckoff lookback", minval=10, group=GRP_WYC)
 int    accumScoreMin = input.int(6, "Accumulation score threshold", minval=1, group=GRP_WYC)
 int    distScoreMin  = input.int(6, "Distribution score threshold", minval=1, group=GRP_WYC)
-float  rangeAtrMax   = input.float(3.0, "Trading-range width max (ATR mult)", step=0.1, group=GRP_WYC)
+float  rangeSpanFrac = input.float(0.7, "Trading-range max span (fraction of ATR x sqrt(lookback))", step=0.05, group=GRP_WYC, tooltip="A drift-free market covers roughly ATR*sqrt(N) over N bars. Values below 1 therefore mean a genuine consolidation, and the setting keeps that meaning at any lookback.")
 
 // --- Scoring ---
 string GRP_SCORE  = "Scoring & Grades"
@@ -547,7 +547,12 @@ if upthrust and signalBar
 float rangeHigh = ta.highest(high, wyckoffLookback)
 float rangeLow  = ta.lowest(low, wyckoffLookback)
 float rangeWidth = rangeHigh - rangeLow
-bool tradingRange = rangeWidth > 0 and rangeWidth <= atr * rangeAtrMax
+// A fixed ATR multiple means a different thing at every lookback, because a drift-free market
+// covers about ATR*sqrt(N) over N bars: the old "40-bar span within 3 ATR" demanded under half
+// that, while the same 3 ATR is loose at a 10-bar lookback and unreachable at 100. Scaling by
+// sqrt(lookback) makes the threshold dimensionless and stable when the lookback changes.
+float expectedSpan = atr * math.sqrt(wyckoffLookback)
+bool tradingRange = rangeWidth > 0 and rangeWidth <= expectedSpan * rangeSpanFrac
 
 int wycHalf = math.max(2, int(wyckoffLookback / 2))
 float atrNow = atr
