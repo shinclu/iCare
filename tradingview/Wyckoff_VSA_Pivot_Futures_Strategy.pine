@@ -1028,11 +1028,48 @@ gradeAllowed(string g) =>
 // 14. STOP / SIZE / RR
 // =============================================================================
 
+// Nearest structure on the given side of px, ignoring levels that are on the wrong side or na
+nearestBelow(float px, float a, float b, float c) =>
+    float best = na
+    if not na(a) and a < px
+        best := na(best) ? a : math.max(best, a)
+    if not na(b) and b < px
+        best := na(best) ? b : math.max(best, b)
+    if not na(c) and c < px
+        best := na(best) ? c : math.max(best, c)
+    best
+
+nearestAbove(float px, float a, float b, float c) =>
+    float best = na
+    if not na(a) and a > px
+        best := na(best) ? a : math.min(best, a)
+    if not na(b) and b > px
+        best := na(best) ? b : math.min(best, b)
+    if not na(c) and c > px
+        best := na(best) ? c : math.min(best, c)
+    best
+
 calculateStop(bool isLong, float entryPx) =>
-    float structStop = isLong ? math.min(nz(springLow, swingLow), swingLow, pivotLow) : math.max(nz(upthrustHigh, swingHigh), swingHigh, pivotHigh)
-    if isLong and not na(lastBreakoutLevel)
+    // math.min of three supports took the FURTHEST one, maximising stop distance. That inflates
+    // stop %, shrinks position size and degrades R:R, which is what drives the "stop too wide"
+    // and "RR < minimum" rejections. Use the nearest structure that still sits beyond entry —
+    // and for a range reversal, the event's own extreme, since that is what invalidates it.
+    bool springCtx   = (springRaw or springTest) and isAccumulation
+    bool upthrustCtx = upthrust and isDistribution
+    float structStop = na
+    if isLong
+        structStop := springCtx and not na(springLow) ? springLow : nearestBelow(entryPx, swingLow, pivotLow, springLow)
+        if na(structStop)
+            structStop := entryPx - atr * atrStopMult
+    else
+        structStop := upthrustCtx and not na(upthrustHigh) ? upthrustHigh : nearestAbove(entryPx, swingHigh, pivotHigh, upthrustHigh)
+        if na(structStop)
+            structStop := entryPx + atr * atrStopMult
+    // A reclaimed breakout level must stay above the stop, but that does not apply to a range
+    // reversal, whose invalidation is its own low rather than a broken level.
+    if isLong and not springCtx and not na(lastBreakoutLevel)
         structStop := math.min(structStop, lastBreakoutLevel - atr * 0.1)
-    if not isLong and not na(lastBreakdownLevel)
+    if not isLong and not upthrustCtx and not na(lastBreakdownLevel)
         structStop := math.max(structStop, lastBreakdownLevel + atr * 0.1)
 
     float atrStop = isLong ? entryPx - atr * atrStopMult : entryPx + atr * atrStopMult
@@ -1528,8 +1565,13 @@ plot(showPivot ? pivotLow : na, "Pivot Low", color=color.new(color.green, 60), s
 
 plotshape(showVsa and sos and signalBar, title="SOS", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny, text="SOS")
 plotshape(showVsa and sow and signalBar, title="SOW", style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny, text="SOW")
-plotshape(showWyckoff and springRaw and signalBar, title="Spring", style=shape.circle, location=location.belowbar, color=color.new(color.aqua, 0), size=size.tiny, text="SP")
-plotshape(showWyckoff and upthrust and signalBar, title="Upthrust", style=shape.circle, location=location.abovebar, color=color.new(color.fuchsia, 0), size=size.tiny, text="UT")
+// detectSpring() requires only a pierce-and-recover of the N-bar low, with no range context, so
+// a lower wick in a downtrend plotted identically to a genuine accumulation spring. Only the
+// first is tradeable, and conflating them on the chart is misleading when judging setups by eye.
+plotshape(showWyckoff and springRaw and isAccumulation and signalBar, title="Spring (in accumulation)", style=shape.circle, location=location.belowbar, color=color.new(color.aqua, 0), size=size.tiny, text="SP")
+plotshape(showWyckoff and springRaw and not isAccumulation and signalBar, title="Spring (no accumulation context)", style=shape.circle, location=location.belowbar, color=color.new(color.gray, 45), size=size.tiny, text="sp")
+plotshape(showWyckoff and upthrust and isDistribution and signalBar, title="Upthrust (in distribution)", style=shape.circle, location=location.abovebar, color=color.new(color.fuchsia, 0), size=size.tiny, text="UT")
+plotshape(showWyckoff and upthrust and not isDistribution and signalBar, title="Upthrust (no distribution context)", style=shape.circle, location=location.abovebar, color=color.new(color.gray, 45), size=size.tiny, text="ut")
 plotshape(showPivot and strongBreakout and signalBar, title="Breakout", style=shape.diamond, location=location.belowbar, color=color.new(color.green, 30), size=size.tiny)
 plotshape(showPivot and retestLong and signalBar, title="Retest L", style=shape.xcross, location=location.belowbar, color=color.new(color.olive, 0), size=size.tiny)
 
