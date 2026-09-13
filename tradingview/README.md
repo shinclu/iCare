@@ -20,6 +20,54 @@ TradingView strategy for Binance Futures USDT-M Perpetual backtests.
 
 ---
 
+## What actually makes an entry good (measured, not asserted)
+
+Measured on `BINANCE:BTCUSDT.P`, 1H, Jan 1 – Sep 13 2026. The **Setup Selection** input group
+enables one setup class at a time, which is how these numbers were attributed.
+
+| Run | Setups enabled | Trades | Net | Win rate | Profit factor | Max DD |
+|---|---|---|---|---|---|---|
+| A | all | 26 | −31.04 (−0.31%) | 42.31% | 0.942 | 2.33% |
+| B | SPRING_TEST + SPRING + UPTHRUST only | **0** | — | — | — | — |
+| C | the other five | 26 | −31.04 (−0.31%) | 42.31% | 0.942 | 2.33% |
+
+Two conclusions follow, and they matter more than the headline number.
+
+**1. Stop placement dominates entry selection.** The single change that moved results was fixing
+`calculateStop`, which took `math.min` of three support levels for a long — the *furthest* one, and
+therefore the widest possible stop. That inflates stop %, shrinks position size and degrades R:R,
+so the `maxStopPercent` and `minRR` filters rejected setups that were otherwise valid. With the
+stop at the *nearest* structure beyond entry, trades went 13 → 26 and profit factor 0.809 → 0.942.
+The census of `NO BUY:` debug labels on the chart made this visible: "Stop too wide" and
+"RR < minimum" were the most frequent rejections by a wide margin.
+
+So a good entry is one where **the invalidation level is close to entry**. That is the real
+content of the Wyckoff spring idea: price pierces support, recovers, and the stop goes just under
+the spring low — tight, well-defined risk and therefore high R:R. Setups entered far from
+structure are penalised automatically through position sizing, with no extra filter needed.
+
+**2. The `SP` / `UT` markers are not all tradeable setups.** `detectSpring()` requires only a
+pierce-and-recover of the N-bar low with a lower wick — it has **no range-context requirement**.
+A lower wick in a downtrend therefore plotted the same `SP` marker as a genuine accumulation
+spring. Judging setups by eye from those markers is a selection effect. The markers are now split:
+
+- **`SP` / `UT`** (bright) — in accumulation / distribution context. Tradeable.
+- **`sp` / `ut`** (dim grey) — no context. Not tradeable, and not counted as a setup.
+
+Run B returning zero trades is consistent with this: over this window BTC trended on 1H, so
+almost no spring occurred inside an established trading range. Three separate bugs had also been
+blocking these setups outright, all now fixed — a `rVol < 1.0` versus `rVol >= 1.0` contradiction
+that made `SPRING_TEST` unreachable, a duplicated trend score floor that overrode the
+range-reversal floor, and trend-premise filters (ADX, BB width, sideway block) applied to setups
+that occur by definition in ranges.
+
+To test the spring premise properly you need a **ranging** period or symbol. The one knob that
+widens recognition is **Trading-range max span** (`rangeSpanFrac`, default `0.475`); raising it
+admits wider ranges as "trading ranges". It is deliberately defaulted to reproduce the measured
+configuration, so change it as a measured experiment rather than an assumption.
+
+---
+
 ## A. BUY (LONG) flow
 
 1. HTF trend score bullish (closed 1H bar via `request.security` + `barmerge.lookahead_off`).
