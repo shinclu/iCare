@@ -162,6 +162,7 @@ float  minBbWidthEntry = input.float(0.008, "Min BB Width to enter", step=0.001,
 float  minRvolEntry = input.float(1.0, "Min relative volume to enter", step=0.1, group=GRP_ANTI)
 bool   blockSidewayEntries = input.bool(true, "Block entries in SIDEWAY regime", group=GRP_ANTI)
 float  minScoreGap = input.float(15.0, "Min score gap vs opposite side", step=1.0, group=GRP_ANTI, tooltip="When both directions score similarly the market is ambiguous; require one side to dominate.")
+bool   exemptRangeReversal = input.bool(true, "Exempt Spring/Test/Upthrust from trend filters", group=GRP_ANTI, tooltip="The ADX, BB width, relative volume, sideway and score-gap filters all assume price is already trending. Spring, Test and Upthrust occur inside a range on contracted volatility, so those filters delete the setup rather than clean it up.")
 
 // --- Visualization ---
 string GRP_VIZ    = "Visualization"
@@ -895,14 +896,16 @@ float sellScore = calculateSellScore()
 string buySetup = "NONE"
 if springTest and sos
     buySetup := "SPRING_TEST"
+// Ahead of retest/pullback: a spring bar can satisfy those too, and the generic label would
+// cost it the range-reversal handling it needs.
+else if springRaw and isAccumulation
+    buySetup := "SPRING"
 else if strongBreakout and sos
     buySetup := "PIVOT_BREAKOUT"
 else if retestLong
     buySetup := "RETEST"
 else if pullbackLong
     buySetup := "PULLBACK"
-else if springRaw and isAccumulation
-    buySetup := "SPRING"
 else if pocketPivotLong
     buySetup := "POCKET_PIVOT"
 else if weakBreakout
@@ -1042,11 +1045,28 @@ bool flat = strategy.position_size == 0
 bool canLongMode  = tradeMode == "BOTH" or tradeMode == "LONG ONLY"
 bool canShortMode = tradeMode == "BOTH" or tradeMode == "SHORT ONLY"
 
-bool antiWhipsawOk =
+// Spring, Test and Upthrust are range-reversal setups: they happen inside a trading range, at
+// its boundary, on contracted volatility. Every filter below encodes the opposite premise —
+// that price is already trending — so applying them here removes the setup by definition
+// instead of filtering noise out of it. detectTest() is the clearest case: it requires
+// rVol < 1.0 while minRvolEntry defaults to 1.0, which made SPRING_TEST unreachable.
+bool rangeReversalLong  = buySetup == "SPRING" or buySetup == "SPRING_TEST"
+bool rangeReversalShort = sellSetup == "UPTHRUST"
+bool rangeExemptLong    = exemptRangeReversal and rangeReversalLong
+bool rangeExemptShort   = exemptRangeReversal and rangeReversalShort
+
+bool trendFilterOk =
      adx >= minAdxEntry and
      atrPct >= minAtrPctEntry and
      bbWidth >= minBbWidthEntry and
      rVol >= minRvolEntry
+
+// A range reversal still has to clear a floor, just not a trend floor: the instrument must be
+// liquid and moving enough to trade at all.
+bool rangeFilterOk = atrPct >= minAtrPctEntry and volume > 0 and spread > 0
+
+bool antiWhipsawLongOk  = rangeExemptLong  ? rangeFilterOk : trendFilterOk
+bool antiWhipsawShortOk = rangeExemptShort ? rangeFilterOk : trendFilterOk
 
 bool notTooFarLong  = math.abs(close - ema50) <= atr * maxDistFromEmaAtr or close < ema50
 bool notTooFarShort = math.abs(close - ema50) <= atr * maxDistFromEmaAtr or close > ema50
@@ -1089,13 +1109,13 @@ else if plannedLongRR < minRR
 else if plannedLongQty <= 0
     longHardPass := false
     noBuyReason := "NO BUY: Position size 0"
-else if not antiWhipsawOk
+else if not antiWhipsawLongOk
     longHardPass := false
     noBuyReason := "NO BUY: Anti-whipsaw filter"
-else if blockSidewayEntries and marketRegime == "SIDEWAY"
+else if blockSidewayEntries and marketRegime == "SIDEWAY" and not rangeExemptLong
     longHardPass := false
     noBuyReason := "NO BUY: Sideway regime"
-else if buyScore - sellScore < minScoreGap
+else if buyScore - sellScore < minScoreGap and not rangeExemptLong
     longHardPass := false
     noBuyReason := "NO BUY: Direction ambiguous"
 else if wyckoffDistScore >= distScoreMin + 2
@@ -1152,13 +1172,13 @@ else if plannedShortRR < minRR
 else if plannedShortQty <= 0
     shortHardPass := false
     noSellReason := "NO SELL: Position size 0"
-else if not antiWhipsawOk
+else if not antiWhipsawShortOk
     shortHardPass := false
     noSellReason := "NO SELL: Anti-whipsaw filter"
-else if blockSidewayEntries and marketRegime == "SIDEWAY"
+else if blockSidewayEntries and marketRegime == "SIDEWAY" and not rangeExemptShort
     shortHardPass := false
     noSellReason := "NO SELL: Sideway regime"
-else if sellScore - buyScore < minScoreGap
+else if sellScore - buyScore < minScoreGap and not rangeExemptShort
     shortHardPass := false
     noSellReason := "NO SELL: Direction ambiguous"
 else if wyckoffAccumScore >= accumScoreMin + 2
