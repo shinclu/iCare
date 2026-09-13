@@ -1,0 +1,1694 @@
+//@version=6
+// =============================================================================
+// Wyckoff + VSA + Pivot + Trend + Retest Strategy
+// Binance Futures USDT-M Perpetual — Backtest Framework
+// Pine Script v6 | No lookahead | No repaint | Confirmed-bar signals by default
+// =============================================================================
+// Signal bar (confirmed close) → Entry on next bar open (process_orders_on_close)
+// HTF via request.security(..., lookahead=barmerge.lookahead_off) on closed HTF bars
+// =============================================================================
+
+strategy(
+     title              = "Wyckoff VSA Pivot Futures Strategy",
+     shorttitle         = "WVP",
+     overlay            = true,
+     pyramiding         = 0,
+     initial_capital    = 10000,
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 0,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.04,
+     slippage           = 2,
+     process_orders_on_close = true,
+     calc_on_every_tick = false,
+     max_labels_count   = 500,
+     max_lines_count    = 500,
+     max_boxes_count    = 100,
+     max_bars_back      = 5000)
+
+// =============================================================================
+// 1. INPUTS
+// =============================================================================
+
+// --- Timeframes / Mode / Dates ---
+string GRP_TF     = "Timeframes & Mode"
+string htfTf      = input.timeframe("60", "Higher Timeframe", group=GRP_TF, tooltip="Default 1H. Primary chart TF is the chart timeframe (e.g. 5m).")
+int    htfMinMult = input.int(4, "Min HTF multiple of chart TF", minval=1, maxval=24, group=GRP_TF, tooltip="A Higher Timeframe at or below the chart timeframe makes the confirmation layer inert. When that happens it is escalated to this multiple of the chart timeframe instead.")
+string tradeMode  = input.string("BOTH", "Trading Mode", options=["LONG ONLY", "SHORT ONLY", "BOTH"], group=GRP_TF)
+bool   useConfirmed = input.bool(true, "Confirmed bar signals only (anti-repaint)", group=GRP_TF)
+bool   allowPyramiding = input.bool(false, "Allow pyramiding (not recommended)", group=GRP_TF)
+int    cooldownBars = input.int(5, "Cooldown bars after exit", minval=0, maxval=50, group=GRP_TF)
+
+string GRP_DATE   = "Date Filter"
+bool   useDateFilter = input.bool(true, "Use date filter", group=GRP_DATE)
+int    startDate  = input.time(timestamp("2023-01-01 00:00"), "Backtest Start", group=GRP_DATE)
+int    endDate    = input.time(timestamp("2030-12-31 23:59"), "Backtest End", group=GRP_DATE)
+
+// --- EMA ---
+string GRP_EMA    = "EMA Structure"
+int    emaFastLen = input.int(9, "EMA Fast", minval=1, group=GRP_EMA)
+int    emaSlowLen = input.int(21, "EMA Slow", minval=1, group=GRP_EMA)
+int    emaTrendLen = input.int(50, "EMA Trend", minval=1, group=GRP_EMA)
+int    emaLongLen = input.int(200, "EMA Long", minval=1, group=GRP_EMA)
+
+// --- Momentum / Vol ---
+string GRP_IND    = "Indicators"
+int    rsiLen     = input.int(14, "RSI Length", minval=1, group=GRP_IND)
+int    macdFast   = input.int(12, "MACD Fast", minval=1, group=GRP_IND)
+int    macdSlow   = input.int(26, "MACD Slow", minval=1, group=GRP_IND)
+int    macdSig    = input.int(9, "MACD Signal", minval=1, group=GRP_IND)
+int    adxLen     = input.int(14, "ADX Length", minval=1, group=GRP_IND)
+float  adxTrendTh = input.float(20.0, "ADX Trend Threshold", step=0.5, group=GRP_IND)
+float  adxStrongTh = input.float(30.0, "ADX Strong Threshold", step=0.5, group=GRP_IND)
+int    atrLen     = input.int(14, "ATR Length", minval=1, group=GRP_IND)
+int    bbLen      = input.int(20, "BB Length", minval=1, group=GRP_IND)
+float  bbMult     = input.float(2.0, "BB Multiplier", step=0.1, group=GRP_IND)
+int    cmfLen     = input.int(20, "CMF Length", minval=1, group=GRP_IND)
+bool   useMfiBonus = input.bool(false, "Use MFI as score bonus only", group=GRP_IND)
+bool   useObvBonus = input.bool(false, "Use OBV as score bonus only", group=GRP_IND)
+int    mfiLen     = input.int(14, "MFI Length", minval=1, group=GRP_IND)
+
+// --- Regime ---
+string GRP_REG    = "Market Regime"
+float  atrPctSideway = input.float(0.0035, "ATR/Close sideway threshold", step=0.0001, group=GRP_REG)
+float  bbWidthSideway = input.float(0.016, "BB Width sideway threshold", step=0.001, group=GRP_REG)
+int    htfBullScoreMin = input.int(4, "HTF Bullish score threshold", minval=1, group=GRP_REG)
+int    htfBearScoreMin = input.int(4, "HTF Bearish score threshold", minval=1, group=GRP_REG)
+int    structureLookback = input.int(20, "Structure HH/HL lookback", minval=5, group=GRP_REG)
+
+// --- Volume / VSA ---
+string GRP_VSA    = "Volume / VSA"
+int    volMaLen   = input.int(20, "Volume MA Length", minval=1, group=GRP_VSA)
+float  volMult    = input.float(1.5, "Volume Breakout Multiplier", step=0.1, group=GRP_VSA)
+float  strongVol  = input.float(2.0, "Strong Volume", step=0.1, group=GRP_VSA)
+float  extremeVol = input.float(3.0, "Extreme Volume", step=0.1, group=GRP_VSA)
+float  minBodyRatio = input.float(0.55, "Minimum Body Ratio", step=0.01, group=GRP_VSA)
+float  minClosePosBull = input.float(0.70, "Min Close Position (Bull)", step=0.01, group=GRP_VSA)
+float  maxClosePosBear = input.float(0.30, "Max Close Position (Bear)", step=0.01, group=GRP_VSA)
+float  noSupplySpreadMult = input.float(0.8, "No Supply max spread vs avg", step=0.05, group=GRP_VSA)
+float  springWickRatio = input.float(0.35, "Spring lower wick / spread", step=0.05, group=GRP_VSA)
+float  springClosePos = input.float(0.55, "Spring min close position", step=0.05, group=GRP_VSA)
+float  locationProxAtr = input.float(0.5, "Support/resistance proximity (ATR)", step=0.1, group=GRP_VSA, tooltip="How close price must be to a pivot or EMA50 for a VSA bar to count as being at a meaningful location.")
+
+// --- Pivot / Retest / Pullback ---
+string GRP_PIV    = "Pivot / Retest / Pullback"
+int    pivotLookback = input.int(20, "Pivot Lookback", minval=2, group=GRP_PIV)
+int    retestWindow = input.int(10, "Retest Window (bars)", minval=1, maxval=50, group=GRP_PIV)
+float  retestTolAtr = input.float(0.25, "Retest tolerance (ATR mult)", step=0.05, group=GRP_PIV)
+int    pocketPivotBars = input.int(10, "Pocket Pivot down-bar lookback", minval=3, group=GRP_PIV)
+float  pullbackTolAtr = input.float(0.5, "Pullback EMA touch tolerance ATR", step=0.1, group=GRP_PIV)
+
+// --- Wyckoff ---
+string GRP_WYC    = "Wyckoff Proxy"
+int    wyckoffLookback = input.int(40, "Wyckoff lookback", minval=10, group=GRP_WYC)
+int    accumScoreMin = input.int(6, "Accumulation score threshold", minval=1, group=GRP_WYC)
+int    distScoreMin  = input.int(6, "Distribution score threshold", minval=1, group=GRP_WYC)
+float  rangeSpanFrac = input.float(0.475, "Trading-range max span (fraction of ATR x sqrt(lookback))", step=0.025, group=GRP_WYC, tooltip="A drift-free market covers roughly ATR*sqrt(N) over N bars, so values below 1 mean a real consolidation and the setting holds its meaning at any lookback. The 0.475 default reproduces the previous fixed 3-ATR test at the 40-bar default. Raising it is the single knob that lets Spring/Upthrust setups be recognised more often - measure before trusting it.")
+
+// --- Scoring ---
+string GRP_SCORE  = "Scoring & Grades"
+int    minBuyScore  = input.int(75, "Minimum BUY Score", minval=0, maxval=100, group=GRP_SCORE)
+int    minSellScore = input.int(75, "Minimum SELL Score", minval=0, maxval=100, group=GRP_SCORE)
+int    strongBuyScore = input.int(85, "STRONG BUY Score", minval=0, maxval=100, group=GRP_SCORE)
+int    strongSellScore = input.int(85, "STRONG SELL Score", minval=0, maxval=100, group=GRP_SCORE)
+int    watchScoreMin = input.int(65, "WATCH score floor", minval=0, maxval=100, group=GRP_SCORE)
+// 40 of the 100 points require an already-established trend (HTF bullish 15, EMA alignment 10,
+// HH/HL 10, STRONG_BULL 5). A spring is by definition the moment before a trend exists, so it
+// cannot earn them and tops out near 66 against a 75 floor. Judge it on range evidence instead.
+int    minBuyScoreRange  = input.int(60, "Minimum BUY Score (range reversal)", minval=0, maxval=100, group=GRP_SCORE, tooltip="Applies to SPRING and SPRING_TEST only. They are scored on range context rather than trend structure, so they need their own floor.")
+int    minSellScoreRange = input.int(60, "Minimum SELL Score (range reversal)", minval=0, maxval=100, group=GRP_SCORE, tooltip="Applies to UPTHRUST only.")
+bool   allowGradeB = input.bool(false, "Allow Grade B setups", group=GRP_SCORE)
+
+// --- Risk ---
+string GRP_RISK   = "Risk Management"
+string stopMode   = input.string("STRUCTURE + ATR BUFFER", "Stop Loss Mode", options=["STRUCTURE", "ATR", "PERCENT", "STRUCTURE + ATR BUFFER"], group=GRP_RISK)
+float  atrStopMult = input.float(1.75, "ATR Stop Multiplier", step=0.05, group=GRP_RISK)
+float  percentStop = input.float(1.5, "Percent Stop %", step=0.1, group=GRP_RISK)
+float  maxStopPercent = input.float(8.0, "Max Stop %", step=0.1, group=GRP_RISK)
+float  absMaxStopPercent = input.float(10.0, "Absolute Max Stop %", step=0.1, group=GRP_RISK)
+float  riskPercent = input.float(0.75, "Risk per Trade % equity", step=0.05, group=GRP_RISK)
+float  maxPositionPercent = input.float(25.0, "Max Position Notional % equity", step=1.0, group=GRP_RISK)
+float  leverage   = input.float(5.0, "Leverage (display / margin note)", step=0.5, group=GRP_RISK)
+float  minRR      = input.float(2.0, "Minimum R:R to nearest structure", step=0.1, group=GRP_RISK)
+int    rrLookback = input.int(50, "RR structure lookback", minval=10, group=GRP_RISK)
+// Losses run the full 1R on the whole position, so wins have to be allowed to exceed
+// it on a meaningful share of size. Taking most of the position off at 2R caps the
+// average win below the average loss and makes the system negative by construction.
+float  tp1R       = input.float(2.0, "TP1 R-multiple", step=0.1, group=GRP_RISK)
+float  tp2R       = input.float(4.0, "TP2 R-multiple", step=0.1, group=GRP_RISK)
+float  tp1QtyPct  = input.float(25.0, "TP1 close % of position", step=1.0, group=GRP_RISK)
+float  tp2QtyPct  = input.float(25.0, "TP2 close % of position", step=1.0, group=GRP_RISK)
+bool   moveBeAt2R = input.bool(true, "Move SL to break-even", group=GRP_RISK)
+float  beTriggerR = input.float(2.5, "BE trigger (R)", step=0.1, group=GRP_RISK, tooltip="Kept separate from TP1 so the runner is not immediately squeezed to break-even.")
+float  trailStartR = input.float(2.5, "Trailing start (R)", step=0.1, group=GRP_RISK)
+float  beBufferPct = input.float(0.05, "BE buffer % (fees)", step=0.01, group=GRP_RISK)
+bool   useStructureExit = input.bool(true, "Exit on structure failure", group=GRP_RISK)
+int    structExitMinSignals = input.int(2, "Structure-fail signals required", minval=1, maxval=5, group=GRP_RISK, tooltip="Requires confluence; 1 makes a single opposing VSA bar close the trade.")
+string trailMode  = input.string("ATR", "Trailing Mode", options=["Swing", "EMA21", "ATR", "Chandelier"], group=GRP_RISK)
+float  trailAtrMult = input.float(3.0, "Trailing ATR Mult", step=0.1, group=GRP_RISK)
+int    swingTrailLen = input.int(10, "Swing trail lookback", minval=2, group=GRP_RISK)
+float  maxDistFromEmaAtr = input.float(4.0, "Max entry distance from EMA50 (ATR)", step=0.5, group=GRP_RISK)
+
+// --- Fees (strategy() defaults also set; inputs for documentation / alerts) ---
+string GRP_FEE    = "Fees (see strategy properties)"
+float  commissionPercent = input.float(0.04, "Commission % (info)", step=0.01, group=GRP_FEE)
+int    slippageTicks = input.int(2, "Slippage ticks (info)", minval=0, group=GRP_FEE)
+
+// --- Relative Strength ---
+string GRP_RS     = "Relative Strength"
+bool   useBenchmark = input.bool(false, "Compare vs Benchmark (optional)", group=GRP_RS)
+string benchmarkSym = input.symbol("BINANCE:BTCUSDT.P", "Benchmark Symbol", group=GRP_RS)
+
+// --- Anti-whipsaw ---
+string GRP_ANTI   = "Anti-Whipsaw"
+float  minAdxEntry = input.float(20.0, "Min ADX to enter", step=0.5, group=GRP_ANTI)
+float  minAtrPctEntry = input.float(0.0015, "Min ATR% to enter", step=0.0001, group=GRP_ANTI)
+float  minBbWidthEntry = input.float(0.008, "Min BB Width to enter", step=0.001, group=GRP_ANTI)
+float  minRvolEntry = input.float(1.0, "Min relative volume to enter", step=0.1, group=GRP_ANTI)
+bool   blockSidewayEntries = input.bool(true, "Block entries in SIDEWAY regime", group=GRP_ANTI)
+float  minScoreGap = input.float(15.0, "Min score gap vs opposite side", step=1.0, group=GRP_ANTI, tooltip="When both directions score similarly the market is ambiguous; require one side to dominate.")
+bool   exemptRangeReversal = input.bool(true, "Exempt Spring/Test/Upthrust from trend filters", group=GRP_ANTI, tooltip="The ADX, BB width, relative volume, sideway and score-gap filters all assume price is already trending. Spring, Test and Upthrust occur inside a range on contracted volatility, so those filters delete the setup rather than clean it up.")
+
+// --- Setup selection ---
+// Toggling setup classes independently is how a setup's contribution gets measured: run the
+// backtest with only one class enabled and read its numbers off the performance summary.
+string GRP_SETUP  = "Setup Selection"
+bool   useSpringTest  = input.bool(true, "Trade SPRING_TEST", group=GRP_SETUP)
+bool   useSpring      = input.bool(true, "Trade SPRING", group=GRP_SETUP)
+bool   useUpthrust    = input.bool(true, "Trade UPTHRUST", group=GRP_SETUP)
+bool   usePivotBreak  = input.bool(true, "Trade PIVOT_BREAKOUT / BREAKDOWN", group=GRP_SETUP)
+bool   useRetest      = input.bool(true, "Trade RETEST", group=GRP_SETUP)
+bool   usePullback    = input.bool(true, "Trade PULLBACK", group=GRP_SETUP)
+bool   usePocketPivot = input.bool(true, "Trade POCKET_PIVOT", group=GRP_SETUP)
+bool   useFailedBreak = input.bool(true, "Trade FAILED_BREAKOUT / BREAKDOWN", group=GRP_SETUP)
+
+// --- Visualization ---
+string GRP_VIZ    = "Visualization"
+bool   showEma    = input.bool(true, "Show EMA", group=GRP_VIZ)
+bool   showPivot  = input.bool(true, "Show Pivot", group=GRP_VIZ)
+bool   showVsa    = input.bool(true, "Show VSA markers", group=GRP_VIZ)
+bool   showWyckoff = input.bool(true, "Show Wyckoff markers", group=GRP_VIZ)
+bool   showEntry  = input.bool(true, "Show Entry labels", group=GRP_VIZ)
+bool   showSlTp   = input.bool(true, "Show SL/TP lines", group=GRP_VIZ)
+bool   showDash   = input.bool(true, "Show Dashboard", group=GRP_VIZ)
+bool   debugMode  = input.bool(false, "Debug Mode", group=GRP_VIZ)
+
+// =============================================================================
+// 2. HELPERS
+// =============================================================================
+
+safeDiv(float a, float b) =>
+    b == 0.0 or na(b) ? 0.0 : a / b
+
+// Confirmed signal gate
+bool signalBar = useConfirmed ? barstate.isconfirmed : true
+
+bool inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+// =============================================================================
+// 3. BASE INDICATORS (LTF = chart)
+// =============================================================================
+
+float ema9   = ta.ema(close, emaFastLen)
+float ema21  = ta.ema(close, emaSlowLen)
+float ema50  = ta.ema(close, emaTrendLen)
+float ema200 = ta.ema(close, emaLongLen)
+
+float rsi    = ta.rsi(close, rsiLen)
+[macdLine, macdSignal, macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+float atr    = ta.atr(atrLen)
+float atrPct = safeDiv(atr, close)
+
+[bbMid, bbUpper, bbLower] = ta.bb(close, bbLen, bbMult)
+float bbWidth = safeDiv(bbUpper - bbLower, bbMid)
+
+float volSma = ta.sma(volume, volMaLen)
+float rVol   = safeDiv(volume, volSma)
+float avgSpread = ta.sma(high - low, volMaLen)
+
+// Chaikin Money Flow computed manually (no builtin available in Pine v6)
+float mfMultiplier = safeDiv((close - low) - (high - close), high - low)
+float mfVolume = mfMultiplier * volume
+float cmf = safeDiv(math.sum(mfVolume, cmfLen), math.sum(volume, cmfLen))
+
+// CE10002: history-dependent calls must run every bar, never inside a conditional
+float mfiVal = ta.mfi(hlc3, mfiLen)
+float obvVal = ta.obv
+bool  obvRising = obvVal > obvVal[5]
+bool  obvFalling = obvVal < obvVal[5]
+
+// VSA candle metrics — never divide by zero
+float spread = high - low
+float body   = math.abs(close - open)
+float bodyRatio = safeDiv(body, spread)
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+float closePosition = spread > 0 ? safeDiv(close - low, spread) : 0.5
+
+// =============================================================================
+// 4. TREND / STRUCTURE SCORES (LTF)
+// =============================================================================
+
+// Slope flags are precomputed by callers so no history lookup happens inside a branch
+getTrendScore(float c, float e21, float e50, float e200, bool e21Rising, bool e50Rising, bool e21Falling, bool e50Falling, bool hhhl, bool lhll, bool bullBias) =>
+    int score = 0
+    if bullBias
+        if c > e200
+            score += 2
+        if e50 > e200
+            score += 2
+        if e21 > e50 or e21Rising
+            score += 1
+        if e50Rising
+            score += 1
+        if hhhl
+            score += 2
+    else
+        if c < e200
+            score += 2
+        if e50 < e200
+            score += 2
+        if e21 < e50 or e21Falling
+            score += 1
+        if e50Falling
+            score += 1
+        if lhll
+            score += 2
+    score
+
+// Price structure: Higher High / Higher Low vs Lower High / Lower Low (confirmed pivots via lookback)
+float swingHigh = ta.highest(high[1], structureLookback)
+float swingLow  = ta.lowest(low[1], structureLookback)
+float prevSwingHigh = ta.highest(high[1 + structureLookback], structureLookback)
+float prevSwingLow  = ta.lowest(low[1 + structureLookback], structureLookback)
+
+// Strict comparisons: with >= / <= a flat range satisfies both at once and the
+// structure component would award bull and bear points on the same bar
+bool hhhl = swingHigh > prevSwingHigh and swingLow > prevSwingLow
+bool lhll = swingHigh < prevSwingHigh and swingLow < prevSwingLow
+
+bool ema21Rising  = ema21 > ema21[3]
+bool ema50Rising  = ema50 > ema50[5]
+bool ema21Falling = ema21 < ema21[3]
+bool ema50Falling = ema50 < ema50[5]
+
+int ltfBullScore = getTrendScore(close, ema21, ema50, ema200, ema21Rising, ema50Rising, ema21Falling, ema50Falling, hhhl, lhll, true)
+int ltfBearScore = getTrendScore(close, ema21, ema50, ema200, ema21Rising, ema50Rising, ema21Falling, ema50Falling, hhhl, lhll, false)
+bool ltfBullish  = ltfBullScore >= htfBullScoreMin
+bool ltfBearish  = ltfBearScore >= htfBearScoreMin
+bool emaBullAlign = ema9 > ema21 and ema21 > ema50 and ema50 > ema200
+bool emaBearAlign = ema9 < ema21 and ema21 < ema50 and ema50 < ema200
+
+// =============================================================================
+// 5. HTF via request.security — ANTI-REPAINT
+// Use closed HTF candle only: request confirmed series with lookahead_off
+// =============================================================================
+
+// HTF metrics on the PREVIOUS completed HTF bar (close[1] inside security = no lookahead)
+htfBundle() =>
+    float c1 = close[1]
+    float e21s = ta.ema(close, emaSlowLen)
+    float e50s = ta.ema(close, emaTrendLen)
+    float e200s = ta.ema(close, emaLongLen)
+    float hE21 = e21s[1]
+    float hE50 = e50s[1]
+    float hE200 = e200s[1]
+    bool hE21Rising  = e21s[1] > e21s[4]
+    bool hE50Rising  = e50s[1] > e50s[6]
+    bool hE21Falling = e21s[1] < e21s[4]
+    bool hE50Falling = e50s[1] < e50s[6]
+    float hAtr = ta.atr(atrLen)[1]
+    float hAtrPct = safeDiv(hAtr, c1)
+    [hDiPlus, hDiMinus, hAdxRaw] = ta.dmi(adxLen, adxLen)
+    float hAdx = hAdxRaw[1]
+    [hMid, hUp, hLo] = ta.bb(close, bbLen, bbMult)
+    float hBbW = safeDiv(hUp[1] - hLo[1], hMid[1])
+    float hSh = ta.highest(high[2], structureLookback)
+    float hSl = ta.lowest(low[2], structureLookback)
+    float hPsh = ta.highest(high[2 + structureLookback], structureLookback)
+    float hPsl = ta.lowest(low[2 + structureLookback], structureLookback)
+    bool hHhhl = hSh > hPsh and hSl > hPsl
+    bool hLhll = hSh < hPsh and hSl < hPsl
+    int bullSc = getTrendScore(c1, hE21, hE50, hE200, hE21Rising, hE50Rising, hE21Falling, hE50Falling, hHhhl, hLhll, true)
+    int bearSc = getTrendScore(c1, hE21, hE50, hE200, hE21Rising, hE50Rising, hE21Falling, hE50Falling, hHhhl, hLhll, false)
+    [c1, hE21, hE50, hE200, hAtrPct, hAdx, hBbW, bullSc, bearSc, hHhhl, hLhll]
+
+// Requesting a timeframe at or below the chart's own returns the chart series back, so every
+// HTF gate passes trivially and the confirmation layer stops filtering without any visible error.
+int    chartTfSec  = timeframe.in_seconds(timeframe.period)
+int    reqHtfSec   = timeframe.in_seconds(htfTf)
+int    escalatedMin = int(math.min(math.max(math.round(chartTfSec * htfMinMult / 60.0), 1), 1440))
+string htfEffective = reqHtfSec > chartTfSec ? htfTf : str.tostring(escalatedMin)
+
+// ANTI-REPAINT: lookahead_off; HTF series already uses [1] completed bar inside bundle
+[htfCloseC, htfE21C, htfE50C, htfE200C, htfAtrPctC, htfAdxC, htfBbWC, htfBullSc, htfBearSc, htfHhhlC, htfLhllC] =
+     request.security(syminfo.tickerid, htfEffective, htfBundle(), barmerge.gaps_off, barmerge.lookahead_off)
+
+int   htfBullScore = int(nz(htfBullSc, 0))
+int   htfBearScore = int(nz(htfBearSc, 0))
+
+bool htfBullish = htfBullScore >= htfBullScoreMin
+bool htfBearish = htfBearScore >= htfBearScoreMin
+
+// =============================================================================
+// 6. MARKET REGIME
+// =============================================================================
+
+getMarketRegime(int bullSc, int bearSc, float adxV, float atrP, float bbW, bool hh, bool ll) =>
+    string regime = "SIDEWAY"
+    bool lowVol = atrP < atrPctSideway or bbW < bbWidthSideway
+    if lowVol and adxV < adxTrendTh
+        regime := "SIDEWAY"
+    else if bullSc >= htfBullScoreMin + 2 and adxV >= adxStrongTh and hh
+        regime := "STRONG_BULL"
+    else if bearSc >= htfBearScoreMin + 2 and adxV >= adxStrongTh and ll
+        regime := "STRONG_BEAR"
+    else if bullSc >= htfBullScoreMin and adxV >= adxTrendTh
+        regime := "BULL"
+    else if bearSc >= htfBearScoreMin and adxV >= adxTrendTh
+        regime := "BEAR"
+    else
+        regime := "SIDEWAY"
+    regime
+
+string htfRegime = getMarketRegime(htfBullScore, htfBearScore, nz(htfAdxC), nz(htfAtrPctC), nz(htfBbWC), htfHhhlC, htfLhllC)
+string ltfRegime = getMarketRegime(ltfBullScore, ltfBearScore, adx, atrPct, bbWidth, hhhl, lhll)
+string marketRegime = htfRegime
+
+// =============================================================================
+// 7. VSA DETECTION
+// =============================================================================
+
+bool isBullCandle = close > open
+bool isBearCandle = close < open
+bool spreadWide   = spread > avgSpread and avgSpread > 0
+
+bool vsaStrongBull =
+     isBullCandle and
+     bodyRatio >= minBodyRatio and
+     closePosition >= minClosePosBull and
+     rVol >= volMult and
+     spreadWide
+
+bool vsaStrongBear =
+     isBearCandle and
+     bodyRatio >= minBodyRatio and
+     closePosition <= maxClosePosBear and
+     rVol >= volMult and
+     spreadWide
+
+bool volVeryStrong = rVol >= strongVol
+bool volExtreme    = rVol >= extremeVol
+
+// Location weighting: near resistance / support / pivots
+float pivotHigh = ta.highest(high[1], pivotLookback)  // ANTI-LOOKAHEAD: exclude current bar
+float pivotLow  = ta.lowest(low[1], pivotLookback)
+
+// Proximity must be two-sided. "low <= ema50 + buffer" is true for every bar under
+// the EMA, which made the location weighting fire almost always and defeated its purpose.
+bool nearSupport = math.abs(low - pivotLow) <= atr * locationProxAtr or math.abs(low - ema50) <= atr * locationProxAtr
+bool nearResist  = math.abs(high - pivotHigh) <= atr * locationProxAtr or math.abs(high - ema50) <= atr * locationProxAtr
+bool breakoutLoc = close > pivotHigh
+bool breakdownLoc = close < pivotLow
+
+float locationBullMult = breakoutLoc ? 1.5 : nearSupport ? 1.25 : 1.0
+float locationBearMult = breakdownLoc ? 1.5 : nearResist ? 1.25 : 1.0
+
+// No Supply (supportive only — not a standalone entry)
+bool noSupply =
+     (isBearCandle or bodyRatio < 0.35) and
+     spread < avgSpread * noSupplySpreadMult and
+     volume < volSma and
+     closePosition >= 0.55 and
+     nearSupport
+
+// No Demand
+bool noDemand =
+     isBullCandle and
+     spread < avgSpread * noSupplySpreadMult and
+     volume < volSma and
+     closePosition <= 0.55 and
+     nearResist
+
+// Volume climax classification
+bool buyingClimax =
+     volExtreme and isBullCandle and closePosition < 0.55 and safeDiv(upperWick, spread) >= 0.35
+
+bool sellingClimax =
+     volExtreme and isBearCandle and closePosition > 0.55 and safeDiv(lowerWick, spread) >= 0.35
+
+bool absorptionBull =
+     volExtreme and isBearCandle and closePosition >= 0.6 and safeDiv(lowerWick, spread) >= 0.35
+
+bool absorptionBear =
+     volExtreme and isBullCandle and closePosition <= 0.4 and safeDiv(upperWick, spread) >= 0.35
+
+getVsaScore(bool bullSide) =>
+    float sc = 0.0
+    if bullSide
+        if vsaStrongBull
+            sc += 15.0 * locationBullMult
+        if volVeryStrong and vsaStrongBull
+            sc += 5.0
+        if volExtreme and vsaStrongBull and not buyingClimax
+            sc += 5.0
+        if noSupply
+            sc += 5.0
+        if sellingClimax or absorptionBull
+            sc += 8.0
+        if buyingClimax
+            sc -= 15.0
+        if vsaStrongBear
+            sc -= 10.0 * locationBearMult
+    else
+        if vsaStrongBear
+            sc += 15.0 * locationBearMult
+        if volVeryStrong and vsaStrongBear
+            sc += 5.0
+        if volExtreme and vsaStrongBear and not sellingClimax
+            sc += 5.0
+        if noDemand
+            sc += 5.0
+        if buyingClimax or absorptionBear
+            sc += 8.0
+        if sellingClimax
+            sc -= 15.0
+        if vsaStrongBull
+            sc -= 10.0 * locationBullMult
+    sc
+
+float vsaBuyScore  = getVsaScore(true)
+float vsaSellScore = getVsaScore(false)
+
+// SOS / SOW
+detectSOS() =>
+    bool sos = vsaStrongBull and (breakoutLoc or close > ema21) and not buyingClimax
+    if volVeryStrong and sos
+        sos := true
+    sos
+
+detectSOW() =>
+    bool sow = vsaStrongBear and (breakdownLoc or close < ema21) and not sellingClimax
+    sow
+
+bool sos = detectSOS()
+bool sow = detectSOW()
+
+// =============================================================================
+// 8. SPRING / UPTHRUST / TEST
+// =============================================================================
+
+float supportLevel = ta.lowest(low[1], wyckoffLookback)
+float resistLevel  = ta.highest(high[1], wyckoffLookback)
+
+// Spring: pierce support then close back above — confirmation on THIS closed bar
+detectSpring() =>
+    bool pierce = low < supportLevel and close > supportLevel
+    bool wickOk = safeDiv(lowerWick, spread) >= springWickRatio
+    bool closeOk = closePosition >= springClosePos
+    pierce and wickOk and closeOk and spread > 0
+
+bool springRaw = detectSpring()
+
+// Track spring for test (stateful)
+var float springLow = na
+var int   springBar = na
+if springRaw and signalBar
+    springLow := low
+    springBar := bar_index
+
+detectTest() =>
+    bool inWindow = not na(springBar) and (bar_index - springBar) > 0 and (bar_index - springBar) <= retestWindow
+    bool testOk = inWindow and not na(springLow) and low >= springLow and close > supportLevel and rVol < 1.0 and spread < avgSpread and isBullCandle
+    testOk
+
+bool springTest = detectTest()
+
+// Upthrust
+detectUpthrust() =>
+    bool pierce = high > resistLevel and close < resistLevel
+    bool wickOk = safeDiv(upperWick, spread) >= springWickRatio
+    bool closeOk = closePosition <= (1.0 - springClosePos)
+    pierce and wickOk and closeOk and rVol >= volMult and spread > 0
+
+bool upthrust = detectUpthrust()
+
+var float upthrustHigh = na
+var int   upthrustBar = na
+if upthrust and signalBar
+    upthrustHigh := high
+    upthrustBar := bar_index
+
+// =============================================================================
+// 9. WYCKOFF ACCUMULATION / DISTRIBUTION PROXY
+// =============================================================================
+
+float rangeHigh = ta.highest(high, wyckoffLookback)
+float rangeLow  = ta.lowest(low, wyckoffLookback)
+float rangeWidth = rangeHigh - rangeLow
+// A fixed ATR multiple means a different thing at every lookback, because a drift-free market
+// covers about ATR*sqrt(N) over N bars: the old "40-bar span within 3 ATR" demanded under half
+// that, while the same 3 ATR is loose at a 10-bar lookback and unreachable at 100. Scaling by
+// sqrt(lookback) makes the threshold dimensionless and stable when the lookback changes.
+float expectedSpan = atr * math.sqrt(wyckoffLookback)
+bool tradingRange = rangeWidth > 0 and rangeWidth <= expectedSpan * rangeSpanFrac
+
+int wycHalf = math.max(2, int(wyckoffLookback / 2))
+float atrNow = atr
+float atrPast = atr[wycHalf]
+float bbWidthPast = bbWidth[wycHalf]
+bool volContraction = atrNow < atrPast and bbWidth < bbWidthPast
+
+float volAvgRecent = ta.sma(volume, wycHalf)
+float volAvgPrior  = ta.sma(volume[wycHalf], wycHalf)
+bool volumeDryUp = volAvgRecent < volAvgPrior * 0.85
+
+// Selling climax / absorption proxy near range low
+// ta.* hoisted out of the and-chain: short-circuiting them breaks history consistency
+float low5 = ta.lowest(low, 5)
+float maxRVol5 = ta.highest(rVol, 5)
+bool scProxy = low5 <= rangeLow + atr * 0.1 and maxRVol5 >= strongVol and (sellingClimax or absorptionBull or close > open)
+
+// Automatic rally proxy
+float wyckoffMidline = ta.sma(close, wyckoffLookback)
+bool arProxy = tradingRange and close > wyckoffMidline and isBullCandle
+
+detectWyckoffAccumulation() =>
+    int sc = 0
+    if tradingRange
+        sc += 2
+    if volContraction
+        sc += 1
+    if volumeDryUp
+        sc += 1
+    if scProxy
+        sc += 2
+    if springRaw
+        sc += 3
+    if springTest
+        sc += 2
+    if sos
+        sc += 3
+    if absorptionBull
+        sc += 2
+    sc
+
+detectWyckoffDistribution() =>
+    int sc = 0
+    if tradingRange and (htfBullish or ltfBullScore > ltfBearScore)
+        sc += 2
+    if not volContraction and rVol >= volMult
+        sc += 1
+    if buyingClimax
+        sc += 3
+    if upthrust
+        sc += 3
+    if noDemand
+        sc += 2
+    if sow
+        sc += 3
+    if breakdownLoc and vsaStrongBear
+        sc += 2
+    sc
+
+int wyckoffAccumScore = detectWyckoffAccumulation()
+int wyckoffDistScore  = detectWyckoffDistribution()
+bool isAccumulation   = wyckoffAccumScore >= accumScoreMin
+bool isDistribution   = wyckoffDistScore >= distScoreMin
+
+string wyckoffState = isAccumulation and not isDistribution ? "ACCUMULATION" : isDistribution and not isAccumulation ? "DISTRIBUTION" : isAccumulation and isDistribution ? "MIXED" : "NEUTRAL"
+
+// VCP / consolidation proxy
+float swingRangeNow = ta.highest(high, 10) - ta.lowest(low, 10)
+float swingRangePrev = ta.highest(high[10], 10) - ta.lowest(low[10], 10)
+float atr10 = atr[10]
+float bbWidth10 = bbWidth[10]
+bool vcpContract = swingRangeNow < swingRangePrev and atr < atr10 and bbWidth < bbWidth10 and volumeDryUp
+int vcpScore = vcpContract ? 2 : 0
+if vcpContract and rVol >= volMult and breakoutLoc
+    vcpScore += 3
+
+int volumeDryUpScore = volumeDryUp ? 2 : 0
+if volumeDryUp and rVol >= strongVol
+    volumeDryUpScore += 3
+
+// =============================================================================
+// 10. PIVOT BREAKOUT / BREAKDOWN / RETEST / PULLBACK / POCKET PIVOT
+// =============================================================================
+
+var float lastBreakoutLevel = na
+var int   lastBreakoutBar = na
+var float lastBreakoutVol = na
+var bool  lastBreakoutWeak = false
+
+var float lastBreakdownLevel = na
+var int   lastBreakdownBar = na
+var float lastBreakdownVol = na
+var bool  lastBreakdownWeak = false
+
+detectBreakout() =>
+    bool bo = close > pivotHigh and bodyRatio >= minBodyRatio and closePosition >= minClosePosBull and spreadWide
+    bool strongVolOk = rVol >= volMult
+    [bo, strongVolOk]
+
+detectBreakdown() =>
+    bool bd = close < pivotLow and bodyRatio >= minBodyRatio and closePosition <= maxClosePosBear and spreadWide
+    bool strongVolOk = rVol >= volMult
+    [bd, strongVolOk]
+
+[breakoutRaw, breakoutVolOk] = detectBreakout()
+[breakdownRaw, breakdownVolOk] = detectBreakdown()
+
+bool strongBreakout = breakoutRaw and breakoutVolOk
+bool weakBreakout   = breakoutRaw and not breakoutVolOk
+bool strongBreakdown = breakdownRaw and breakdownVolOk
+bool weakBreakdown   = breakdownRaw and not breakdownVolOk
+
+if strongBreakout or weakBreakout
+    if signalBar
+        lastBreakoutLevel := pivotHigh
+        lastBreakoutBar := bar_index
+        lastBreakoutVol := volume
+        lastBreakoutWeak := weakBreakout
+
+if strongBreakdown or weakBreakdown
+    if signalBar
+        lastBreakdownLevel := pivotLow
+        lastBreakdownBar := bar_index
+        lastBreakdownVol := volume
+        lastBreakdownWeak := weakBreakdown
+
+// Confirmation must be a real demand bar. Accepting any green candle made almost
+// every touch of the level qualify as a retest.
+detectRetestLong() =>
+    bool inWin = not na(lastBreakoutBar) and (bar_index - lastBreakoutBar) >= 1 and (bar_index - lastBreakoutBar) <= retestWindow
+    float tol = atr * retestTolAtr
+    bool touch = inWin and not na(lastBreakoutLevel) and low <= lastBreakoutLevel + tol and close > lastBreakoutLevel
+    bool volPull = not na(lastBreakoutVol) and volume < lastBreakoutVol
+    bool conf = sos or noSupply or (isBullCandle and closePosition >= minClosePosBull and bodyRatio >= minBodyRatio)
+    // A retest only rehabilitates a low-volume breakout if this bar brings the volume
+    bool originOk = not lastBreakoutWeak or rVol >= volMult
+    touch and volPull and conf and originOk
+
+detectRetestShort() =>
+    bool inWin = not na(lastBreakdownBar) and (bar_index - lastBreakdownBar) >= 1 and (bar_index - lastBreakdownBar) <= retestWindow
+    float tol = atr * retestTolAtr
+    bool touch = inWin and not na(lastBreakdownLevel) and high >= lastBreakdownLevel - tol and close < lastBreakdownLevel
+    bool volPull = not na(lastBreakdownVol) and volume < lastBreakdownVol
+    bool conf = sow or noDemand or (isBearCandle and closePosition <= maxClosePosBear and bodyRatio >= minBodyRatio)
+    bool originOk = not lastBreakdownWeak or rVol >= volMult
+    touch and volPull and conf and originOk
+
+bool retestLong  = detectRetestLong()
+bool retestShort = detectRetestShort()
+
+// Failed breakout
+bool failedBreakout =
+     not na(lastBreakoutLevel) and
+     not na(lastBreakoutBar) and
+     (bar_index - lastBreakoutBar) <= retestWindow and
+     close < lastBreakoutLevel and
+     isBearCandle and
+     rVol >= volMult
+
+bool failedBreakdown =
+     not na(lastBreakdownLevel) and
+     not na(lastBreakdownBar) and
+     (bar_index - lastBreakdownBar) <= retestWindow and
+     close > lastBreakdownLevel and
+     isBullCandle and
+     rVol >= volMult
+
+// Pullback long
+detectPullbackLong() =>
+    bool trendOk = htfBullish and emaBullAlign
+    float tol = atr * pullbackTolAtr
+    bool touchEma = low <= ema21 + tol or low <= ema50 + tol
+    bool hold = close > ema50 or close > ema21
+    bool volContract = rVol < 1.0
+    bool noSow = not sow
+    bool rev = isBullCandle and closePosition >= 0.55 and not vsaStrongBear
+    trendOk and touchEma and hold and volContract and noSow and rev
+
+detectPullbackShort() =>
+    bool trendOk = htfBearish and emaBearAlign
+    float tol = atr * pullbackTolAtr
+    bool touchEma = high >= ema21 - tol or high >= ema50 - tol
+    bool hold = close < ema50 or close < ema21
+    bool volContract = rVol < 1.0
+    bool noSos = not sos
+    bool rev = isBearCandle and closePosition <= 0.45 and not vsaStrongBull
+    trendOk and touchEma and hold and volContract and noSos and rev
+
+bool pullbackLong  = detectPullbackLong()
+bool pullbackShort = detectPullbackShort()
+
+// Pocket Pivot (sideways / choppy) — volume > max of recent down-bar volumes
+float maxDownVol = 0.0
+for i = 1 to pocketPivotBars
+    if close[i] < open[i]
+        maxDownVol := math.max(maxDownVol, volume[i])
+
+bool pocketPivotLong =
+     (marketRegime == "SIDEWAY" or marketRegime == "BULL") and
+     marketRegime != "STRONG_BEAR" and
+     close > ema21 and
+     isBullCandle and
+     closePosition >= minClosePosBull and
+     volume > maxDownVol and
+     maxDownVol > 0 and
+     not ltfBearish
+
+bool pocketPivotShort =
+     (marketRegime == "SIDEWAY" or marketRegime == "BEAR") and
+     marketRegime != "STRONG_BULL" and
+     close < ema21 and
+     isBearCandle and
+     closePosition <= maxClosePosBear and
+     volume > maxDownVol and
+     maxDownVol > 0 and
+     not ltfBullish
+
+// =============================================================================
+// 11. RELATIVE STRENGTH (optional)
+// =============================================================================
+
+// Relative strength vs benchmark — security() must be called unconditionally (Pine rule)
+float benchCloseSec = request.security(benchmarkSym, timeframe.period, close[1], barmerge.gaps_off, barmerge.lookahead_off)
+float symRet = safeDiv(close - close[20], close[20])
+float benchRet = safeDiv(benchCloseSec - benchCloseSec[20], benchCloseSec[20])
+bool rsBull = useBenchmark and symRet > benchRet
+bool rsBear = useBenchmark and symRet < benchRet
+
+// =============================================================================
+// 12. MOMENTUM BONUS (soft — never hard AND)
+// =============================================================================
+
+float momBuyBonus = 0.0
+if rsi > 50 and rsi < 75
+    momBuyBonus += 2.0
+if macdHist > 0 and macdLine > macdSignal
+    momBuyBonus += 2.0
+if cmf > 0
+    momBuyBonus += 1.0
+if useMfiBonus and not na(mfiVal) and mfiVal > 50
+    momBuyBonus += 1.0
+if useObvBonus and obvRising
+    momBuyBonus += 1.0
+if rsBull
+    momBuyBonus += 3.0
+
+float momSellBonus = 0.0
+if rsi < 50 and rsi > 25
+    momSellBonus += 2.0
+if macdHist < 0 and macdLine < macdSignal
+    momSellBonus += 2.0
+if cmf < 0
+    momSellBonus += 1.0
+if useMfiBonus and not na(mfiVal) and mfiVal < 50
+    momSellBonus += 1.0
+if useObvBonus and obvFalling
+    momSellBonus += 1.0
+if rsBear
+    momSellBonus += 3.0
+
+// =============================================================================
+// 13. BUY / SELL SCORE
+// =============================================================================
+
+calculateBuyScore() =>
+    float sc = 0.0
+    // Trend
+    if htfBullish
+        sc += 15.0
+    if htfRegime == "STRONG_BULL"
+        sc += 5.0
+    if htfRegime == "STRONG_BEAR"
+        sc -= 25.0
+    if htfRegime == "BEAR"
+        sc -= 10.0
+    if emaBullAlign
+        sc += 10.0
+    if hhhl
+        sc += 10.0
+    // Wyckoff
+    if isAccumulation
+        sc += 10.0
+    if springRaw or springTest
+        sc += 10.0
+    if isDistribution
+        sc -= 15.0
+    // VSA
+    sc += math.min(vsaBuyScore, 20.0)
+    if sos
+        sc += 15.0
+    if sow
+        sc -= 15.0
+    // Pivot / setups
+    if strongBreakout
+        sc += 10.0
+    if weakBreakout
+        sc -= 10.0
+    if retestLong
+        sc += 8.0
+    if pullbackLong
+        sc += 8.0
+    if pocketPivotLong
+        sc += 5.0
+    if failedBreakout
+        sc -= 20.0
+    if vcpScore >= 3
+        sc += 5.0
+    // Regime
+    if marketRegime == "SIDEWAY"
+        sc -= 5.0
+    // Range context replaces the trend points a spring cannot earn. Each item below is the
+    // evidence Wyckoff actually asks for at a spring: an established range, supply drying up,
+    // the pierce being absorbed, and the event happening at the boundary rather than mid-range.
+    if (springRaw or springTest) and isAccumulation
+        if tradingRange
+            sc += 10.0
+        if volContraction or volumeDryUp
+            sc += 8.0
+        if absorptionBull or noSupply
+            sc += 8.0
+        if not na(pivotLow) and math.abs(low - pivotLow) <= atr * locationProxAtr
+            sc += 6.0
+        // A range is this setup's precondition, not a defect, so the sideway penalty is refunded
+        if marketRegime == "SIDEWAY"
+            sc += 5.0
+    // Momentum soft
+    sc += math.min(momBuyBonus, 5.0)
+    // Normalize soft clamp 0-100
+    sc := math.max(0.0, math.min(100.0, sc))
+    sc
+
+calculateSellScore() =>
+    float sc = 0.0
+    if htfBearish
+        sc += 15.0
+    if htfRegime == "STRONG_BEAR"
+        sc += 5.0
+    if htfRegime == "STRONG_BULL"
+        sc -= 25.0
+    if htfRegime == "BULL"
+        sc -= 10.0
+    if emaBearAlign
+        sc += 10.0
+    if lhll
+        sc += 10.0
+    if isDistribution
+        sc += 10.0
+    if upthrust
+        sc += 10.0
+    if isAccumulation
+        sc -= 15.0
+    sc += math.min(vsaSellScore, 20.0)
+    if sow
+        sc += 15.0
+    if sos
+        sc -= 15.0
+    if strongBreakdown
+        sc += 10.0
+    if weakBreakdown
+        sc -= 10.0
+    if retestShort
+        sc += 8.0
+    if pullbackShort
+        sc += 8.0
+    if pocketPivotShort
+        sc += 5.0
+    if failedBreakdown
+        sc -= 20.0
+    if marketRegime == "SIDEWAY"
+        sc -= 5.0
+    // Mirror of the spring credits: an upthrust is judged on distribution-range evidence
+    // rather than on downtrend structure that does not exist yet.
+    if upthrust and isDistribution
+        if tradingRange
+            sc += 10.0
+        if volContraction or volumeDryUp
+            sc += 8.0
+        if absorptionBear or noDemand
+            sc += 8.0
+        if not na(pivotHigh) and math.abs(high - pivotHigh) <= atr * locationProxAtr
+            sc += 6.0
+        if marketRegime == "SIDEWAY"
+            sc += 5.0
+    sc += math.min(momSellBonus, 5.0)
+    sc := math.max(0.0, math.min(100.0, sc))
+    sc
+
+float buyScore  = calculateBuyScore()
+float sellScore = calculateSellScore()
+
+// Setup type & grade
+string buySetup = "NONE"
+if springTest and sos
+    buySetup := "SPRING_TEST"
+// Ahead of retest/pullback: a spring bar can satisfy those too, and the generic label would
+// cost it the range-reversal handling it needs.
+else if springRaw and isAccumulation
+    buySetup := "SPRING"
+else if strongBreakout and sos
+    buySetup := "PIVOT_BREAKOUT"
+else if retestLong
+    buySetup := "RETEST"
+else if pullbackLong
+    buySetup := "PULLBACK"
+else if pocketPivotLong
+    buySetup := "POCKET_PIVOT"
+else if weakBreakout
+    buySetup := "WEAK_BREAKOUT"
+
+string sellSetup = "NONE"
+if upthrust and sow
+    sellSetup := "UPTHRUST"
+else if strongBreakdown and sow
+    sellSetup := "PIVOT_BREAKDOWN"
+else if retestShort
+    sellSetup := "RETEST"
+else if pullbackShort
+    sellSetup := "PULLBACK"
+else if failedBreakout
+    sellSetup := "FAILED_BREAKOUT"
+else if pocketPivotShort
+    sellSetup := "POCKET_PIVOT"
+else if weakBreakdown
+    sellSetup := "WEAK_BREAKDOWN"
+
+setupEnabled(string s) =>
+    bool ok = false
+    if s == "SPRING_TEST"
+        ok := useSpringTest
+    else if s == "SPRING"
+        ok := useSpring
+    else if s == "UPTHRUST"
+        ok := useUpthrust
+    else if s == "PIVOT_BREAKOUT" or s == "PIVOT_BREAKDOWN"
+        ok := usePivotBreak
+    else if s == "RETEST"
+        ok := useRetest
+    else if s == "PULLBACK"
+        ok := usePullback
+    else if s == "POCKET_PIVOT"
+        ok := usePocketPivot
+    else if s == "FAILED_BREAKOUT" or s == "FAILED_BREAKDOWN"
+        ok := useFailedBreak
+    ok
+
+getGrade(float score, string setup, bool isLong) =>
+    string g = "C"
+    int strongTh = isLong ? strongBuyScore : strongSellScore
+    int minTh = isLong ? minBuyScore : minSellScore
+    // Range reversals are scored on a different rubric, so they grade against their own floor
+    if setup == "SPRING" or setup == "SPRING_TEST" or setup == "UPTHRUST"
+        minTh := isLong ? minBuyScoreRange : minSellScoreRange
+    // FAILED_BREAKOUT is reactive rather than a planned entry, so it does not earn S grade
+    bool core = setup == "PIVOT_BREAKOUT" or setup == "PIVOT_BREAKDOWN" or setup == "RETEST" or setup == "SPRING_TEST" or setup == "UPTHRUST"
+    bool aSetup = setup == "PULLBACK" or setup == "SPRING" or setup == "FAILED_BREAKOUT"
+    bool bSetup = setup == "POCKET_PIVOT"
+    if score >= strongTh and core and (isLong ? htfBullish : htfBearish) and (isLong ? sos or springTest : sow or upthrust)
+        g := "S+"
+    else if score >= minTh and core
+        g := "S"
+    else if score >= minTh and aSetup
+        g := "A"
+    else if score >= watchScoreMin and bSetup
+        g := "B"
+    else if score >= watchScoreMin
+        g := "C"
+    else
+        g := "C"
+    g
+
+string buyGrade  = getGrade(buyScore, buySetup, true)
+string sellGrade = getGrade(sellScore, sellSetup, false)
+
+gradeAllowed(string g) =>
+    g == "S+" or g == "S" or g == "A" or (allowGradeB and g == "B")
+
+// =============================================================================
+// 14. STOP / SIZE / RR
+// =============================================================================
+
+// Nearest structure on the given side of px, ignoring levels that are on the wrong side or na
+nearestBelow(float px, float a, float b, float c) =>
+    float best = na
+    if not na(a) and a < px
+        best := na(best) ? a : math.max(best, a)
+    if not na(b) and b < px
+        best := na(best) ? b : math.max(best, b)
+    if not na(c) and c < px
+        best := na(best) ? c : math.max(best, c)
+    best
+
+nearestAbove(float px, float a, float b, float c) =>
+    float best = na
+    if not na(a) and a > px
+        best := na(best) ? a : math.min(best, a)
+    if not na(b) and b > px
+        best := na(best) ? b : math.min(best, b)
+    if not na(c) and c > px
+        best := na(best) ? c : math.min(best, c)
+    best
+
+calculateStop(bool isLong, float entryPx) =>
+    // math.min of three supports took the FURTHEST one, maximising stop distance. That inflates
+    // stop %, shrinks position size and degrades R:R, which is what drives the "stop too wide"
+    // and "RR < minimum" rejections. Use the nearest structure that still sits beyond entry —
+    // and for a range reversal, the event's own extreme, since that is what invalidates it.
+    bool springCtx   = (springRaw or springTest) and isAccumulation
+    bool upthrustCtx = upthrust and isDistribution
+    float structStop = na
+    if isLong
+        structStop := springCtx and not na(springLow) ? springLow : nearestBelow(entryPx, swingLow, pivotLow, springLow)
+        if na(structStop)
+            structStop := entryPx - atr * atrStopMult
+    else
+        structStop := upthrustCtx and not na(upthrustHigh) ? upthrustHigh : nearestAbove(entryPx, swingHigh, pivotHigh, upthrustHigh)
+        if na(structStop)
+            structStop := entryPx + atr * atrStopMult
+    // A reclaimed breakout level must stay above the stop, but that does not apply to a range
+    // reversal, whose invalidation is its own low rather than a broken level.
+    if isLong and not springCtx and not na(lastBreakoutLevel)
+        structStop := math.min(structStop, lastBreakoutLevel - atr * 0.1)
+    if not isLong and not upthrustCtx and not na(lastBreakdownLevel)
+        structStop := math.max(structStop, lastBreakdownLevel + atr * 0.1)
+
+    float atrStop = isLong ? entryPx - atr * atrStopMult : entryPx + atr * atrStopMult
+    float pctStop = isLong ? entryPx * (1.0 - percentStop / 100.0) : entryPx * (1.0 + percentStop / 100.0)
+
+    float sl = atrStop
+    if stopMode == "STRUCTURE"
+        sl := structStop
+    else if stopMode == "ATR"
+        sl := atrStop
+    else if stopMode == "PERCENT"
+        sl := pctStop
+    else  // STRUCTURE + ATR BUFFER
+        sl := isLong ? structStop - atr * 0.25 : structStop + atr * 0.25
+
+    // Ensure stop is on correct side
+    if isLong and sl >= entryPx
+        sl := entryPx - atr * atrStopMult
+    if not isLong and sl <= entryPx
+        sl := entryPx + atr * atrStopMult
+    sl
+
+calculatePositionSize(float entryPx, float stopPx) =>
+    float stopDist = math.abs(entryPx - stopPx)
+    float riskAmt = strategy.equity * riskPercent / 100.0
+    float qty = stopDist > 0 ? riskAmt / stopDist : 0.0
+    float maxNotional = strategy.equity * maxPositionPercent / 100.0
+    float notional = qty * entryPx
+    if notional > maxNotional and entryPx > 0
+        qty := maxNotional / entryPx
+    // Min qty guard
+    if qty * entryPx < syminfo.mintick * 10
+        qty := 0.0
+    qty
+
+// RR must be measured against structure. Measuring it against a target that is itself
+// defined as tp1R * risk would always return tp1R, making the minRR filter dead code.
+calculateRR(float entryPx, float stopPx, float targetPx, bool isLong) =>
+    float risk = math.abs(entryPx - stopPx)
+    float reward = isLong ? targetPx - entryPx : entryPx - targetPx
+    reward <= 0 ? 0.0 : safeDiv(reward, risk)
+
+// Planned levels using close as proxy for signal-bar decision (entry ≈ next open ≈ close for RR filter)
+float plannedEntry = close
+float plannedLongSL  = calculateStop(true, plannedEntry)
+float plannedShortSL = calculateStop(false, plannedEntry)
+float plannedLongR   = math.abs(plannedEntry - plannedLongSL)
+float plannedShortR  = math.abs(plannedShortSL - plannedEntry)
+float plannedLongTP1 = plannedEntry + plannedLongR * tp1R
+float plannedLongTP2 = plannedEntry + plannedLongR * tp2R
+float plannedShortTP1 = plannedEntry - plannedShortR * tp1R
+float plannedShortTP2 = plannedEntry - plannedShortR * tp2R
+
+// Room to the nearest opposing structure; blank overhead means the path is clear
+float overheadResistance = ta.highest(high[1], rrLookback)
+float underlyingSupport  = ta.lowest(low[1], rrLookback)
+bool  clearAboveLong  = overheadResistance <= plannedEntry
+bool  clearBelowShort = underlyingSupport >= plannedEntry
+float plannedLongRR  = clearAboveLong ? tp2R : calculateRR(plannedEntry, plannedLongSL, overheadResistance, true)
+float plannedShortRR = clearBelowShort ? tp2R : calculateRR(plannedEntry, plannedShortSL, underlyingSupport, false)
+float plannedLongQty = calculatePositionSize(plannedEntry, plannedLongSL)
+float plannedShortQty = calculatePositionSize(plannedEntry, plannedShortSL)
+
+float longStopPct  = safeDiv(math.abs(plannedEntry - plannedLongSL), plannedEntry) * 100.0
+float shortStopPct = safeDiv(math.abs(plannedShortSL - plannedEntry), plannedEntry) * 100.0
+
+// =============================================================================
+// 15. HARD FILTERS + ENTRY DECISION
+// =============================================================================
+
+var int lastExitBar = na
+var int lastLongEntryBar = na
+var int lastShortEntryBar = na
+var string noBuyReason = ""
+var string noSellReason = ""
+
+bool cooldownOk = na(lastExitBar) or (bar_index - lastExitBar) > cooldownBars
+bool flat = strategy.position_size == 0
+bool canLongMode  = tradeMode == "BOTH" or tradeMode == "LONG ONLY"
+bool canShortMode = tradeMode == "BOTH" or tradeMode == "SHORT ONLY"
+
+// Spring, Test and Upthrust are range-reversal setups: they happen inside a trading range, at
+// its boundary, on contracted volatility. Every filter below encodes the opposite premise —
+// that price is already trending — so applying them here removes the setup by definition
+// instead of filtering noise out of it. detectTest() is the clearest case: it requires
+// rVol < 1.0 while minRvolEntry defaults to 1.0, which made SPRING_TEST unreachable.
+bool rangeReversalLong  = buySetup == "SPRING" or buySetup == "SPRING_TEST"
+bool rangeReversalShort = sellSetup == "UPTHRUST"
+bool rangeExemptLong    = exemptRangeReversal and rangeReversalLong
+bool rangeExemptShort   = exemptRangeReversal and rangeReversalShort
+
+bool trendFilterOk =
+     adx >= minAdxEntry and
+     atrPct >= minAtrPctEntry and
+     bbWidth >= minBbWidthEntry and
+     rVol >= minRvolEntry
+
+// A range reversal still has to clear a floor, just not a trend floor: the instrument must be
+// liquid and moving enough to trade at all.
+bool rangeFilterOk = atrPct >= minAtrPctEntry and volume > 0 and spread > 0
+
+bool antiWhipsawLongOk  = rangeExemptLong  ? rangeFilterOk : trendFilterOk
+bool antiWhipsawShortOk = rangeExemptShort ? rangeFilterOk : trendFilterOk
+
+bool notTooFarLong  = math.abs(close - ema50) <= atr * maxDistFromEmaAtr or close < ema50
+bool notTooFarShort = math.abs(close - ema50) <= atr * maxDistFromEmaAtr or close > ema50
+
+bool longHardPass = true
+noBuyReason := ""
+if not inDateRange
+    longHardPass := false
+    noBuyReason := "NO BUY: Outside date range"
+else if not signalBar
+    longHardPass := false
+    noBuyReason := "NO BUY: Wait bar confirm"
+else if not canLongMode
+    longHardPass := false
+    noBuyReason := "NO BUY: Mode not LONG"
+else if not flat and not allowPyramiding
+    longHardPass := false
+    noBuyReason := "NO BUY: Already in position"
+else if not cooldownOk
+    longHardPass := false
+    noBuyReason := "NO BUY: Cooldown"
+else if htfRegime == "STRONG_BEAR"
+    longHardPass := false
+    noBuyReason := "NO BUY: HTF STRONG_BEAR"
+else if buyScore < (rangeReversalLong ? minBuyScoreRange : minBuyScore)
+    longHardPass := false
+    noBuyReason := "NO BUY: Score < threshold"
+else if not gradeAllowed(buyGrade)
+    longHardPass := false
+    noBuyReason := "NO BUY: Grade " + buyGrade + " not allowed"
+else if buySetup == "NONE" or buySetup == "WEAK_BREAKOUT"
+    longHardPass := false
+    noBuyReason := "NO BUY: Weak/no setup"
+else if not setupEnabled(buySetup)
+    longHardPass := false
+    noBuyReason := "NO BUY: " + buySetup + " disabled"
+else if longStopPct > maxStopPercent or longStopPct > absMaxStopPercent
+    longHardPass := false
+    noBuyReason := "NO BUY: Stop too wide"
+else if plannedLongRR < minRR
+    longHardPass := false
+    noBuyReason := "NO BUY: RR < minimum"
+else if plannedLongQty <= 0
+    longHardPass := false
+    noBuyReason := "NO BUY: Position size 0"
+else if not antiWhipsawLongOk
+    longHardPass := false
+    noBuyReason := "NO BUY: Anti-whipsaw filter"
+else if blockSidewayEntries and marketRegime == "SIDEWAY" and not rangeExemptLong
+    longHardPass := false
+    noBuyReason := "NO BUY: Sideway regime"
+else if buyScore - sellScore < minScoreGap and not rangeExemptLong
+    longHardPass := false
+    noBuyReason := "NO BUY: Direction ambiguous"
+else if wyckoffDistScore >= distScoreMin + 2
+    longHardPass := false
+    noBuyReason := "NO BUY: Distribution score high"
+else if failedBreakout
+    longHardPass := false
+    noBuyReason := "NO BUY: Failed breakout"
+else if not notTooFarLong and buySetup != "PULLBACK"
+    longHardPass := false
+    noBuyReason := "NO BUY: Price too far from EMA"
+else if spread <= 0 or volume <= 0
+    longHardPass := false
+    noBuyReason := "NO BUY: Invalid spread/volume"
+else if not na(lastLongEntryBar) and bar_index - lastLongEntryBar < cooldownBars
+    longHardPass := false
+    noBuyReason := "NO BUY: Recent long / re-entry block"
+
+bool shortHardPass = true
+noSellReason := ""
+if not inDateRange
+    shortHardPass := false
+    noSellReason := "NO SELL: Outside date range"
+else if not signalBar
+    shortHardPass := false
+    noSellReason := "NO SELL: Wait bar confirm"
+else if not canShortMode
+    shortHardPass := false
+    noSellReason := "NO SELL: Mode not SHORT"
+else if not flat and not allowPyramiding
+    shortHardPass := false
+    noSellReason := "NO SELL: Already in position"
+else if not cooldownOk
+    shortHardPass := false
+    noSellReason := "NO SELL: Cooldown"
+else if htfRegime == "STRONG_BULL"
+    shortHardPass := false
+    noSellReason := "NO SELL: HTF STRONG_BULL"
+else if sellScore < (rangeReversalShort ? minSellScoreRange : minSellScore)
+    shortHardPass := false
+    noSellReason := "NO SELL: Score < threshold"
+else if not gradeAllowed(sellGrade)
+    shortHardPass := false
+    noSellReason := "NO SELL: Grade " + sellGrade + " not allowed"
+else if sellSetup == "NONE" or sellSetup == "WEAK_BREAKDOWN"
+    shortHardPass := false
+    noSellReason := "NO SELL: Weak/no setup"
+else if not setupEnabled(sellSetup)
+    shortHardPass := false
+    noSellReason := "NO SELL: " + sellSetup + " disabled"
+else if shortStopPct > maxStopPercent or shortStopPct > absMaxStopPercent
+    shortHardPass := false
+    noSellReason := "NO SELL: Stop too wide"
+else if plannedShortRR < minRR
+    shortHardPass := false
+    noSellReason := "NO SELL: RR < minimum"
+else if plannedShortQty <= 0
+    shortHardPass := false
+    noSellReason := "NO SELL: Position size 0"
+else if not antiWhipsawShortOk
+    shortHardPass := false
+    noSellReason := "NO SELL: Anti-whipsaw filter"
+else if blockSidewayEntries and marketRegime == "SIDEWAY" and not rangeExemptShort
+    shortHardPass := false
+    noSellReason := "NO SELL: Sideway regime"
+else if sellScore - buyScore < minScoreGap and not rangeExemptShort
+    shortHardPass := false
+    noSellReason := "NO SELL: Direction ambiguous"
+else if wyckoffAccumScore >= accumScoreMin + 2
+    shortHardPass := false
+    noSellReason := "NO SELL: Accumulation score high"
+else if failedBreakdown
+    shortHardPass := false
+    noSellReason := "NO SELL: Failed breakdown"
+else if not notTooFarShort and sellSetup != "PULLBACK"
+    shortHardPass := false
+    noSellReason := "NO SELL: Price too far from EMA"
+else if spread <= 0 or volume <= 0
+    shortHardPass := false
+    noSellReason := "NO SELL: Invalid spread/volume"
+else if not na(lastShortEntryBar) and bar_index - lastShortEntryBar < cooldownBars
+    shortHardPass := false
+    noSellReason := "NO SELL: Recent short / re-entry block"
+
+// These re-apply the score floor that longHardPass/shortHardPass already checked. They must use
+// the same effective threshold, or the trend floor silently overrides the range-reversal one.
+bool longSignal  = longHardPass and buyScore >= (rangeReversalLong ? minBuyScoreRange : minBuyScore) and gradeAllowed(buyGrade)
+bool shortSignal = shortHardPass and sellScore >= (rangeReversalShort ? minSellScoreRange : minSellScore) and gradeAllowed(sellGrade)
+bool strongLongSignal  = longSignal and buyScore >= strongBuyScore
+bool strongShortSignal = shortSignal and sellScore >= strongSellScore
+
+// Separates "this setup never occurs" from "it occurs but something rejects it". Without the
+// split, a zero-trade setup class is indistinguishable from a mis-specified filter.
+var int    wyckClassified = 0
+var int    wyckEntered    = 0
+var string wyckLastBlock  = "-"
+
+if signalBar and (rangeReversalLong or rangeReversalShort)
+    wyckClassified += 1
+    if (rangeReversalLong and longSignal) or (rangeReversalShort and shortSignal)
+        wyckEntered += 1
+    else
+        string r = rangeReversalLong ? noBuyReason : noSellReason
+        wyckLastBlock := r == "" ? "Grade or score gate" : r
+
+// Prefer higher score if both fire same bar
+if longSignal and shortSignal
+    if buyScore >= sellScore
+        shortSignal := false
+        strongShortSignal := false
+    else
+        longSignal := false
+        strongLongSignal := false
+
+// =============================================================================
+// 16. POSITION STATE / MANAGEMENT
+// =============================================================================
+
+var float entryPrice = na
+var float stopPrice  = na
+var float tp1Price   = na
+var float tp2Price   = na
+var float trailStop  = na
+var float riskR      = na
+var string activeSetup = ""
+var float entryQty   = na
+
+// Detect exits for cooldown
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    lastExitBar := bar_index
+    entryPrice := na
+    stopPrice := na
+    tp1Price := na
+    tp2Price := na
+    trailStop := na
+    riskR := na
+    activeSetup := ""
+    entryQty := na
+
+// Entries — strategy enters on next bar because process_orders_on_close=true
+// Signal confirmed at bar close → order processed at that close / next open per TV rules
+if longSignal
+    float sl = plannedLongSL
+    float qty = plannedLongQty
+    float rDist = plannedLongR
+    strategy.entry("Long", strategy.long, qty=qty, comment=buySetup + " | " + str.tostring(buyScore, "#.#"))
+    entryPrice := plannedEntry
+    stopPrice := sl
+    riskR := rDist
+    tp1Price := plannedLongTP1
+    tp2Price := plannedLongTP2
+    trailStop := sl
+    activeSetup := buySetup
+    entryQty := qty
+    lastLongEntryBar := bar_index
+
+if shortSignal
+    float sl = plannedShortSL
+    float qty = plannedShortQty
+    float rDist = plannedShortR
+    strategy.entry("Short", strategy.short, qty=qty, comment=sellSetup + " | " + str.tostring(sellScore, "#.#"))
+    entryPrice := plannedEntry
+    stopPrice := sl
+    riskR := rDist
+    tp1Price := plannedShortTP1
+    tp2Price := plannedShortTP2
+    trailStop := sl
+    activeSetup := sellSetup
+    entryQty := qty
+    lastShortEntryBar := bar_index
+
+// Sync entry price from strategy when filled
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    entryPrice := strategy.position_avg_price
+    riskR := math.abs(entryPrice - stopPrice)
+    tp1Price := entryPrice + riskR * tp1R
+    tp2Price := entryPrice + riskR * tp2R
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    entryPrice := strategy.position_avg_price
+    riskR := math.abs(stopPrice - entryPrice)
+    tp1Price := entryPrice - riskR * tp1R
+    tp2Price := entryPrice - riskR * tp2R
+
+// Trailing candidates evaluated every bar (CE10002) and selected inside the manage functions
+float swingTrailLow  = ta.lowest(low, swingTrailLen)
+float swingTrailHigh = ta.highest(high, swingTrailLen)
+float chandelierLong  = swingTrailHigh - atr * trailAtrMult
+float chandelierShort = swingTrailLow + atr * trailAtrMult
+
+// Best excursion since entry drives break-even and trailing activation.
+// Using the recorded extreme instead of the current bar keeps the ratchet monotonic.
+var float maxFavor = na
+var float initQty  = na
+
+if strategy.position_size == 0
+    maxFavor := na
+    initQty := na
+else if strategy.position_size[1] == 0
+    initQty := math.abs(strategy.position_size)
+    maxFavor := strategy.position_size > 0 ? high : low
+else if strategy.position_size > 0
+    maxFavor := math.max(nz(maxFavor, high), high)
+else
+    maxFavor := math.min(nz(maxFavor, low), low)
+
+// Count opposing evidence; a single bearish bar is not enough to abandon a long
+longStructFailCount() =>
+    int c = 0
+    if sow
+        c += 1
+    if failedBreakout
+        c += 1
+    if ema9 < ema21 and ema21 < ema50 and close < ema50
+        c += 1
+    if htfRegime == "STRONG_BEAR"
+        c += 1
+    if not na(pivotLow) and close < pivotLow and rVol >= volMult
+        c += 1
+    c
+
+shortStructFailCount() =>
+    int c = 0
+    if sos
+        c += 1
+    if failedBreakdown
+        c += 1
+    if ema9 > ema21 and ema21 > ema50 and close > ema50
+        c += 1
+    if htfRegime == "STRONG_BULL"
+        c += 1
+    if not na(pivotHigh) and close > pivotHigh and rVol >= volMult
+        c += 1
+    c
+
+int longFailSignals  = longStructFailCount()
+int shortFailSignals = shortStructFailCount()
+
+manageLong() =>
+    float newTrail = trailStop
+    float newStop = stopPrice
+
+    if strategy.position_size > 0 and not na(entryPrice) and not na(riskR) and riskR > 0
+        // Break-even and trailing activate off recorded excursion, not the live bar
+        bool beReached = moveBeAt2R and nz(maxFavor, high) >= entryPrice + riskR * beTriggerR
+        bool trailOn   = nz(maxFavor, high) >= entryPrice + riskR * trailStartR
+
+        if beReached
+            newStop := math.max(newStop, entryPrice * (1.0 + beBufferPct / 100.0))
+        if trailOn
+            float cand = newStop
+            if trailMode == "ATR"
+                cand := close - atr * trailAtrMult
+            else if trailMode == "EMA21"
+                cand := ema21
+            else if trailMode == "Swing"
+                cand := swingTrailLow
+            else  // Chandelier
+                cand := chandelierLong
+            newTrail := math.max(nz(newTrail, cand), cand, newStop)
+            newStop := newTrail
+
+        // Bracket exits: TP fills at the limit price intrabar rather than at bar close
+        float q1 = nz(initQty) * tp1QtyPct / 100.0
+        float q2 = nz(initQty) * tp2QtyPct / 100.0
+        if q1 > 0
+            strategy.exit("L-TP1", from_entry="Long", qty=q1, limit=tp1Price, comment="TP1")
+        if q2 > 0
+            strategy.exit("L-TP2", from_entry="Long", qty=q2, limit=tp2Price, comment="TP2")
+        // Runner order carries the stop for whatever size remains
+        strategy.exit("L-RUN", from_entry="Long", stop=newStop, comment="SL/Trail")
+
+        if useStructureExit and longFailSignals >= structExitMinSignals and signalBar
+            strategy.close("Long", comment="Structure Fail")
+    [newStop, newTrail]
+
+manageShort() =>
+    float newTrail = trailStop
+    float newStop = stopPrice
+
+    if strategy.position_size < 0 and not na(entryPrice) and not na(riskR) and riskR > 0
+        bool beReached = moveBeAt2R and nz(maxFavor, low) <= entryPrice - riskR * beTriggerR
+        bool trailOn   = nz(maxFavor, low) <= entryPrice - riskR * trailStartR
+
+        if beReached
+            newStop := math.min(newStop, entryPrice * (1.0 - beBufferPct / 100.0))
+        if trailOn
+            float cand = newStop
+            if trailMode == "ATR"
+                cand := close + atr * trailAtrMult
+            else if trailMode == "EMA21"
+                cand := ema21
+            else if trailMode == "Swing"
+                cand := swingTrailHigh
+            else
+                cand := chandelierShort
+            newTrail := math.min(nz(newTrail, cand), cand, newStop)
+            newStop := newTrail
+
+        float q1 = nz(initQty) * tp1QtyPct / 100.0
+        float q2 = nz(initQty) * tp2QtyPct / 100.0
+        if q1 > 0
+            strategy.exit("S-TP1", from_entry="Short", qty=q1, limit=tp1Price, comment="TP1")
+        if q2 > 0
+            strategy.exit("S-TP2", from_entry="Short", qty=q2, limit=tp2Price, comment="TP2")
+        // Runner order carries the stop for whatever size remains
+        strategy.exit("S-RUN", from_entry="Short", stop=newStop, comment="SL/Trail")
+
+        if useStructureExit and shortFailSignals >= structExitMinSignals and signalBar
+            strategy.close("Short", comment="Structure Fail")
+    [newStop, newTrail]
+
+// Both managers run every bar and no-op when flat, so history stays consistent (CE10002)
+[lStop, lTrail] = manageLong()
+[sStop, sTrail] = manageShort()
+
+if strategy.position_size > 0
+    stopPrice := lStop
+    trailStop := lTrail
+else if strategy.position_size < 0
+    stopPrice := sStop
+    trailStop := sTrail
+
+// Exit alerts
+bool exitLongSignal  = strategy.position_size[1] > 0 and strategy.position_size == 0
+bool exitShortSignal = strategy.position_size[1] < 0 and strategy.position_size == 0
+
+// =============================================================================
+// 17. VISUALIZATION
+// =============================================================================
+
+plot(showEma ? ema9 : na, "EMA9", color=color.new(color.teal, 0), linewidth=1)
+plot(showEma ? ema21 : na, "EMA21", color=color.new(color.orange, 0), linewidth=1)
+plot(showEma ? ema50 : na, "EMA50", color=color.new(color.blue, 0), linewidth=2)
+plot(showEma ? ema200 : na, "EMA200", color=color.new(color.purple, 0), linewidth=2)
+
+plot(showPivot ? pivotHigh : na, "Pivot High", color=color.new(color.red, 60), style=plot.style_linebr)
+plot(showPivot ? pivotLow : na, "Pivot Low", color=color.new(color.green, 60), style=plot.style_linebr)
+
+plotshape(showVsa and sos and signalBar, title="SOS", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny, text="SOS")
+plotshape(showVsa and sow and signalBar, title="SOW", style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny, text="SOW")
+// detectSpring() requires only a pierce-and-recover of the N-bar low, with no range context, so
+// a lower wick in a downtrend plotted identically to a genuine accumulation spring. Only the
+// first is tradeable, and conflating them on the chart is misleading when judging setups by eye.
+plotshape(showWyckoff and springRaw and isAccumulation and signalBar, title="Spring (in accumulation)", style=shape.circle, location=location.belowbar, color=color.new(color.aqua, 0), size=size.tiny, text="SP")
+plotshape(showWyckoff and springRaw and not isAccumulation and signalBar, title="Spring (no accumulation context)", style=shape.circle, location=location.belowbar, color=color.new(color.gray, 45), size=size.tiny, text="sp")
+plotshape(showWyckoff and upthrust and isDistribution and signalBar, title="Upthrust (in distribution)", style=shape.circle, location=location.abovebar, color=color.new(color.fuchsia, 0), size=size.tiny, text="UT")
+plotshape(showWyckoff and upthrust and not isDistribution and signalBar, title="Upthrust (no distribution context)", style=shape.circle, location=location.abovebar, color=color.new(color.gray, 45), size=size.tiny, text="ut")
+plotshape(showPivot and strongBreakout and signalBar, title="Breakout", style=shape.diamond, location=location.belowbar, color=color.new(color.green, 30), size=size.tiny)
+plotshape(showPivot and retestLong and signalBar, title="Retest L", style=shape.xcross, location=location.belowbar, color=color.new(color.olive, 0), size=size.tiny)
+
+plotshape(showEntry and longSignal and not strongLongSignal, title="BUY", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.small)
+plotshape(showEntry and strongLongSignal, title="STRONG BUY", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), text="S-BUY", textcolor=color.black, size=size.normal)
+plotshape(showEntry and shortSignal and not strongShortSignal, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.small)
+plotshape(showEntry and strongShortSignal, title="STRONG SELL", style=shape.labeldown, location=location.abovebar, color=color.new(color.maroon, 0), text="S-SELL", textcolor=color.white, size=size.normal)
+
+plot(showSlTp and strategy.position_size != 0 ? stopPrice : na, "Stop Loss", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(showSlTp and strategy.position_size != 0 ? tp1Price : na, "TP1", color=color.green, style=plot.style_linebr, linewidth=1)
+plot(showSlTp and strategy.position_size != 0 ? tp2Price : na, "TP2", color=color.teal, style=plot.style_linebr, linewidth=1)
+plot(showSlTp and strategy.position_size != 0 ? trailStop : na, "Trail", color=color.orange, style=plot.style_linebr, linewidth=1)
+
+bgcolor(marketRegime == "STRONG_BULL" ? color.new(color.green, 92) : marketRegime == "STRONG_BEAR" ? color.new(color.red, 92) : marketRegime == "SIDEWAY" ? color.new(color.gray, 94) : na)
+
+// =============================================================================
+// 18. DASHBOARD
+// =============================================================================
+
+var table dash = table.new(position.top_right, 2, 24, bgcolor=color.new(color.black, 75), border_width=1)
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "Metric", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 0, "Value", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 0, 1, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, marketRegime, text_color=color.yellow, text_size=size.small)
+    table.cell(dash, 0, 2, "HTF Trend (" + htfEffective + ")", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, htfBullish ? "BULL " + str.tostring(htfBullScore) : htfBearish ? "BEAR " + str.tostring(htfBearScore) : "NEUTRAL", text_color=color.aqua, text_size=size.small)
+    table.cell(dash, 0, 3, "LTF Trend", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, ltfBullish ? "BULL " + str.tostring(ltfBullScore) : ltfBearish ? "BEAR " + str.tostring(ltfBearScore) : "NEUTRAL", text_color=color.aqua, text_size=size.small)
+    table.cell(dash, 0, 4, "BUY Score", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(buyScore, "#.#") + " [" + buyGrade + "]", text_color=color.lime, text_size=size.small)
+    table.cell(dash, 0, 5, "SELL Score", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(sellScore, "#.#") + " [" + sellGrade + "]", text_color=color.red, text_size=size.small)
+    table.cell(dash, 0, 6, "Wyckoff", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, wyckoffState + " A" + str.tostring(wyckoffAccumScore) + "/D" + str.tostring(wyckoffDistScore), text_color=color.orange, text_size=size.small)
+    table.cell(dash, 0, 7, "Volume", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, "rVol " + str.tostring(rVol, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 8, "Setup", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 8, strategy.position_size > 0 ? activeSetup : strategy.position_size < 0 ? activeSetup : (buySetup != "NONE" ? buySetup : sellSetup), text_color=color.yellow, text_size=size.small)
+    table.cell(dash, 0, 9, "Entry", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9, na(entryPrice) ? "-" : str.tostring(entryPrice, format.mintick), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 10, "Stop", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 10, na(stopPrice) ? "-" : str.tostring(stopPrice, format.mintick), text_color=color.red, text_size=size.small)
+    table.cell(dash, 0, 11, "TP1 / TP2", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 11, (na(tp1Price) ? "-" : str.tostring(tp1Price, format.mintick)) + " / " + (na(tp2Price) ? "-" : str.tostring(tp2Price, format.mintick)), text_color=color.lime, text_size=size.small)
+    table.cell(dash, 0, 12, "R:R", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 12, strategy.position_size > 0 ? str.tostring(plannedLongRR, "#.##") : strategy.position_size < 0 ? str.tostring(plannedShortRR, "#.##") : str.tostring(math.max(plannedLongRR, plannedShortRR), "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 13, "Pos Size", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 13, na(entryQty) ? str.tostring(math.max(plannedLongQty, plannedShortQty), "#.####") : str.tostring(entryQty, "#.####"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 14, "Position", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 14, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", text_color=color.aqua, text_size=size.small)
+    table.cell(dash, 0, 15, "ADX", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 15, str.tostring(adx, "#.#"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 16, "ATR%", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 16, str.tostring(atrPct * 100.0, "#.###") + "%", text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 17, "BB Width", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 17, str.tostring(bbWidth, "#.####"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 18, "Leverage*", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 18, str.tostring(leverage, "#.#") + "x (not risk)", text_color=color.gray, text_size=size.small)
+    if debugMode
+        table.cell(dash, 0, 19, "Debug BUY", text_color=color.olive, text_size=size.tiny)
+        table.cell(dash, 1, 19, noBuyReason == "" ? "OK" : noBuyReason, text_color=color.olive, text_size=size.tiny)
+        table.cell(dash, 0, 20, "Debug SELL", text_color=color.olive, text_size=size.tiny)
+        table.cell(dash, 1, 20, noSellReason == "" ? "OK" : noSellReason, text_color=color.olive, text_size=size.tiny)
+        table.cell(dash, 0, 21, "Scores", text_color=color.olive, text_size=size.tiny)
+        table.cell(dash, 1, 21, "VSA B/S " + str.tostring(vsaBuyScore, "#") + "/" + str.tostring(vsaSellScore, "#") + " VCP " + str.tostring(vcpScore), text_color=color.olive, text_size=size.tiny)
+        table.cell(dash, 0, 22, "Wyckoff cls/ent", text_color=color.aqua, text_size=size.tiny)
+        table.cell(dash, 1, 22, str.tostring(wyckClassified) + " / " + str.tostring(wyckEntered), text_color=color.aqua, text_size=size.tiny)
+        table.cell(dash, 0, 23, "Wyck last block", text_color=color.aqua, text_size=size.tiny)
+        table.cell(dash, 1, 23, wyckLastBlock, text_color=color.aqua, text_size=size.tiny)
+
+// Debug labels
+if debugMode and signalBar and not longSignal and buyScore >= watchScoreMin and noBuyReason != ""
+    label.new(bar_index, low, noBuyReason, style=label.style_label_up, color=color.new(color.gray, 70), textcolor=color.white, size=size.tiny)
+if debugMode and signalBar and not shortSignal and sellScore >= watchScoreMin and noSellReason != ""
+    label.new(bar_index, high, noSellReason, style=label.style_label_down, color=color.new(color.gray, 70), textcolor=color.white, size=size.tiny)
+
+// =============================================================================
+// 19. ALERTS
+// =============================================================================
+
+alertMsg(string side, string sig, float entry, float sl, float tp1, float tp2, float score, string setup) =>
+    syminfo.ticker + " | " + timeframe.period + " | " + sig + " | Entry:" + str.tostring(entry, format.mintick) + " SL:" + str.tostring(sl, format.mintick) + " TP1:" + str.tostring(tp1, format.mintick) + " TP2:" + str.tostring(tp2, format.mintick) + " Score:" + str.tostring(score, "#.#") + " Setup:" + setup + " Side:" + side
+
+if longSignal
+    alert(alertMsg("LONG", strongLongSignal ? "STRONG LONG" : "LONG", plannedEntry, plannedLongSL, plannedLongTP1, plannedLongTP2, buyScore, buySetup), alert.freq_once_per_bar_close)
+if shortSignal
+    alert(alertMsg("SHORT", strongShortSignal ? "STRONG SHORT" : "SHORT", plannedEntry, plannedShortSL, plannedShortTP1, plannedShortTP2, sellScore, sellSetup), alert.freq_once_per_bar_close)
+if exitLongSignal
+    alert(syminfo.ticker + " | EXIT LONG", alert.freq_once_per_bar_close)
+if exitShortSignal
+    alert(syminfo.ticker + " | EXIT SHORT", alert.freq_once_per_bar_close)
+
+alertcondition(longSignal and not strongLongSignal, title="LONG signal", message="LONG signal")
+alertcondition(shortSignal and not strongShortSignal, title="SHORT signal", message="SHORT signal")
+alertcondition(strongLongSignal, title="STRONG LONG", message="STRONG LONG")
+alertcondition(strongShortSignal, title="STRONG SHORT", message="STRONG SHORT")
+alertcondition(exitLongSignal, title="EXIT LONG", message="EXIT LONG")
+alertcondition(exitShortSignal, title="EXIT SHORT", message="EXIT SHORT")
+alertcondition(failedBreakout and signalBar, title="FAILED BREAKOUT", message="FAILED BREAKOUT")
+alertcondition(sos and signalBar, title="SOS", message="SOS")
+alertcondition(sow and signalBar, title="SOW", message="SOW")
+alertcondition(springRaw and signalBar, title="SPRING", message="SPRING")
+alertcondition(upthrust and signalBar, title="UPTHRUST", message="UPTHRUST")
+alertcondition((retestLong or retestShort) and signalBar, title="RETEST", message="RETEST")
+
+// =============================================================================
+// 20. BACKTEST METRICS NOTES (Strategy Tester provides primary metrics)
+// Net Profit, Win Rate, Profit Factor, Max DD, etc. appear in TV Strategy Tester.
+// Setup tags are stored in entry comments for manual segmentation:
+// PIVOT_BREAKOUT | RETEST | PULLBACK | POCKET_PIVOT | SPRING | SPRING_TEST | UPTHRUST | FAILED_BREAKOUT
+// Commission default 0.04% | Slippage 2 ticks — adjust in strategy properties for Binance Futures.
+// Risk is equity% at stop distance; leverage input is informational only (does not inflate size).
+// =============================================================================
