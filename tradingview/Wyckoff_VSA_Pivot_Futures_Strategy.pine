@@ -103,7 +103,7 @@ string GRP_WYC    = "Wyckoff Proxy"
 int    wyckoffLookback = input.int(40, "Wyckoff lookback", minval=10, group=GRP_WYC)
 int    accumScoreMin = input.int(6, "Accumulation score threshold", minval=1, group=GRP_WYC)
 int    distScoreMin  = input.int(6, "Distribution score threshold", minval=1, group=GRP_WYC)
-float  rangeSpanFrac = input.float(0.7, "Trading-range max span (fraction of ATR x sqrt(lookback))", step=0.05, group=GRP_WYC, tooltip="A drift-free market covers roughly ATR*sqrt(N) over N bars. Values below 1 therefore mean a genuine consolidation, and the setting keeps that meaning at any lookback.")
+float  rangeSpanFrac = input.float(0.475, "Trading-range max span (fraction of ATR x sqrt(lookback))", step=0.025, group=GRP_WYC, tooltip="A drift-free market covers roughly ATR*sqrt(N) over N bars, so values below 1 mean a real consolidation and the setting holds its meaning at any lookback. The 0.475 default reproduces the previous fixed 3-ATR test at the 40-bar default. Raising it is the single knob that lets Spring/Upthrust setups be recognised more often - measure before trusting it.")
 
 // --- Scoring ---
 string GRP_SCORE  = "Scoring & Grades"
