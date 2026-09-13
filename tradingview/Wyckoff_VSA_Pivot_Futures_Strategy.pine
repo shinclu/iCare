@@ -164,6 +164,19 @@ bool   blockSidewayEntries = input.bool(true, "Block entries in SIDEWAY regime",
 float  minScoreGap = input.float(15.0, "Min score gap vs opposite side", step=1.0, group=GRP_ANTI, tooltip="When both directions score similarly the market is ambiguous; require one side to dominate.")
 bool   exemptRangeReversal = input.bool(true, "Exempt Spring/Test/Upthrust from trend filters", group=GRP_ANTI, tooltip="The ADX, BB width, relative volume, sideway and score-gap filters all assume price is already trending. Spring, Test and Upthrust occur inside a range on contracted volatility, so those filters delete the setup rather than clean it up.")
 
+// --- Setup selection ---
+// Toggling setup classes independently is how a setup's contribution gets measured: run the
+// backtest with only one class enabled and read its numbers off the performance summary.
+string GRP_SETUP  = "Setup Selection"
+bool   useSpringTest  = input.bool(true, "Trade SPRING_TEST", group=GRP_SETUP)
+bool   useSpring      = input.bool(true, "Trade SPRING", group=GRP_SETUP)
+bool   useUpthrust    = input.bool(true, "Trade UPTHRUST", group=GRP_SETUP)
+bool   usePivotBreak  = input.bool(true, "Trade PIVOT_BREAKOUT / BREAKDOWN", group=GRP_SETUP)
+bool   useRetest      = input.bool(true, "Trade RETEST", group=GRP_SETUP)
+bool   usePullback    = input.bool(true, "Trade PULLBACK", group=GRP_SETUP)
+bool   usePocketPivot = input.bool(true, "Trade POCKET_PIVOT", group=GRP_SETUP)
+bool   useFailedBreak = input.bool(true, "Trade FAILED_BREAKOUT / BREAKDOWN", group=GRP_SETUP)
+
 // --- Visualization ---
 string GRP_VIZ    = "Visualization"
 bool   showEma    = input.bool(true, "Show EMA", group=GRP_VIZ)
@@ -927,6 +940,26 @@ else if pocketPivotShort
 else if weakBreakdown
     sellSetup := "WEAK_BREAKDOWN"
 
+setupEnabled(string s) =>
+    bool ok = false
+    if s == "SPRING_TEST"
+        ok := useSpringTest
+    else if s == "SPRING"
+        ok := useSpring
+    else if s == "UPTHRUST"
+        ok := useUpthrust
+    else if s == "PIVOT_BREAKOUT" or s == "PIVOT_BREAKDOWN"
+        ok := usePivotBreak
+    else if s == "RETEST"
+        ok := useRetest
+    else if s == "PULLBACK"
+        ok := usePullback
+    else if s == "POCKET_PIVOT"
+        ok := usePocketPivot
+    else if s == "FAILED_BREAKOUT" or s == "FAILED_BREAKDOWN"
+        ok := useFailedBreak
+    ok
+
 getGrade(float score, string setup, bool isLong) =>
     string g = "C"
     int strongTh = isLong ? strongBuyScore : strongSellScore
@@ -1100,6 +1133,9 @@ else if not gradeAllowed(buyGrade)
 else if buySetup == "NONE" or buySetup == "WEAK_BREAKOUT"
     longHardPass := false
     noBuyReason := "NO BUY: Weak/no setup"
+else if not setupEnabled(buySetup)
+    longHardPass := false
+    noBuyReason := "NO BUY: " + buySetup + " disabled"
 else if longStopPct > maxStopPercent or longStopPct > absMaxStopPercent
     longHardPass := false
     noBuyReason := "NO BUY: Stop too wide"
@@ -1163,6 +1199,9 @@ else if not gradeAllowed(sellGrade)
 else if sellSetup == "NONE" or sellSetup == "WEAK_BREAKDOWN"
     shortHardPass := false
     noSellReason := "NO SELL: Weak/no setup"
+else if not setupEnabled(sellSetup)
+    shortHardPass := false
+    noSellReason := "NO SELL: " + sellSetup + " disabled"
 else if shortStopPct > maxStopPercent or shortStopPct > absMaxStopPercent
     shortHardPass := false
     noSellReason := "NO SELL: Stop too wide"
