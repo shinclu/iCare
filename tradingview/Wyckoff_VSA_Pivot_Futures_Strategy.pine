@@ -112,6 +112,11 @@ int    minSellScore = input.int(75, "Minimum SELL Score", minval=0, maxval=100, 
 int    strongBuyScore = input.int(85, "STRONG BUY Score", minval=0, maxval=100, group=GRP_SCORE)
 int    strongSellScore = input.int(85, "STRONG SELL Score", minval=0, maxval=100, group=GRP_SCORE)
 int    watchScoreMin = input.int(65, "WATCH score floor", minval=0, maxval=100, group=GRP_SCORE)
+// 40 of the 100 points require an already-established trend (HTF bullish 15, EMA alignment 10,
+// HH/HL 10, STRONG_BULL 5). A spring is by definition the moment before a trend exists, so it
+// cannot earn them and tops out near 66 against a 75 floor. Judge it on range evidence instead.
+int    minBuyScoreRange  = input.int(60, "Minimum BUY Score (range reversal)", minval=0, maxval=100, group=GRP_SCORE, tooltip="Applies to SPRING and SPRING_TEST only. They are scored on range context rather than trend structure, so they need their own floor.")
+int    minSellScoreRange = input.int(60, "Minimum SELL Score (range reversal)", minval=0, maxval=100, group=GRP_SCORE, tooltip="Applies to UPTHRUST only.")
 bool   allowGradeB = input.bool(false, "Allow Grade B setups", group=GRP_SCORE)
 
 // --- Risk ---
@@ -853,6 +858,21 @@ calculateBuyScore() =>
     // Regime
     if marketRegime == "SIDEWAY"
         sc -= 5.0
+    // Range context replaces the trend points a spring cannot earn. Each item below is the
+    // evidence Wyckoff actually asks for at a spring: an established range, supply drying up,
+    // the pierce being absorbed, and the event happening at the boundary rather than mid-range.
+    if (springRaw or springTest) and isAccumulation
+        if tradingRange
+            sc += 10.0
+        if volContraction or volumeDryUp
+            sc += 8.0
+        if absorptionBull or noSupply
+            sc += 8.0
+        if not na(pivotLow) and math.abs(low - pivotLow) <= atr * locationProxAtr
+            sc += 6.0
+        // A range is this setup's precondition, not a defect, so the sideway penalty is refunded
+        if marketRegime == "SIDEWAY"
+            sc += 5.0
     // Momentum soft
     sc += math.min(momBuyBonus, 5.0)
     // Normalize soft clamp 0-100
@@ -898,6 +918,19 @@ calculateSellScore() =>
         sc -= 20.0
     if marketRegime == "SIDEWAY"
         sc -= 5.0
+    // Mirror of the spring credits: an upthrust is judged on distribution-range evidence
+    // rather than on downtrend structure that does not exist yet.
+    if upthrust and isDistribution
+        if tradingRange
+            sc += 10.0
+        if volContraction or volumeDryUp
+            sc += 8.0
+        if absorptionBear or noDemand
+            sc += 8.0
+        if not na(pivotHigh) and math.abs(high - pivotHigh) <= atr * locationProxAtr
+            sc += 6.0
+        if marketRegime == "SIDEWAY"
+            sc += 5.0
     sc += math.min(momSellBonus, 5.0)
     sc := math.max(0.0, math.min(100.0, sc))
     sc
@@ -964,6 +997,9 @@ getGrade(float score, string setup, bool isLong) =>
     string g = "C"
     int strongTh = isLong ? strongBuyScore : strongSellScore
     int minTh = isLong ? minBuyScore : minSellScore
+    // Range reversals are scored on a different rubric, so they grade against their own floor
+    if setup == "SPRING" or setup == "SPRING_TEST" or setup == "UPTHRUST"
+        minTh := isLong ? minBuyScoreRange : minSellScoreRange
     // FAILED_BREAKOUT is reactive rather than a planned entry, so it does not earn S grade
     bool core = setup == "PIVOT_BREAKOUT" or setup == "PIVOT_BREAKDOWN" or setup == "RETEST" or setup == "SPRING_TEST" or setup == "UPTHRUST"
     bool aSetup = setup == "PULLBACK" or setup == "SPRING" or setup == "FAILED_BREAKOUT"
@@ -1124,7 +1160,7 @@ else if not cooldownOk
 else if htfRegime == "STRONG_BEAR"
     longHardPass := false
     noBuyReason := "NO BUY: HTF STRONG_BEAR"
-else if buyScore < minBuyScore
+else if buyScore < (rangeReversalLong ? minBuyScoreRange : minBuyScore)
     longHardPass := false
     noBuyReason := "NO BUY: Score < threshold"
 else if not gradeAllowed(buyGrade)
@@ -1190,7 +1226,7 @@ else if not cooldownOk
 else if htfRegime == "STRONG_BULL"
     shortHardPass := false
     noSellReason := "NO SELL: HTF STRONG_BULL"
-else if sellScore < minSellScore
+else if sellScore < (rangeReversalShort ? minSellScoreRange : minSellScore)
     shortHardPass := false
     noSellReason := "NO SELL: Score < threshold"
 else if not gradeAllowed(sellGrade)
