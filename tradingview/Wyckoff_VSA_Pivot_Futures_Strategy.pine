@@ -1272,10 +1272,26 @@ else if not na(lastShortEntryBar) and bar_index - lastShortEntryBar < cooldownBa
     shortHardPass := false
     noSellReason := "NO SELL: Recent short / re-entry block"
 
-bool longSignal  = longHardPass and buyScore >= minBuyScore and gradeAllowed(buyGrade)
-bool shortSignal = shortHardPass and sellScore >= minSellScore and gradeAllowed(sellGrade)
+// These re-apply the score floor that longHardPass/shortHardPass already checked. They must use
+// the same effective threshold, or the trend floor silently overrides the range-reversal one.
+bool longSignal  = longHardPass and buyScore >= (rangeReversalLong ? minBuyScoreRange : minBuyScore) and gradeAllowed(buyGrade)
+bool shortSignal = shortHardPass and sellScore >= (rangeReversalShort ? minSellScoreRange : minSellScore) and gradeAllowed(sellGrade)
 bool strongLongSignal  = longSignal and buyScore >= strongBuyScore
 bool strongShortSignal = shortSignal and sellScore >= strongSellScore
+
+// Separates "this setup never occurs" from "it occurs but something rejects it". Without the
+// split, a zero-trade setup class is indistinguishable from a mis-specified filter.
+var int    wyckClassified = 0
+var int    wyckEntered    = 0
+var string wyckLastBlock  = "-"
+
+if signalBar and (rangeReversalLong or rangeReversalShort)
+    wyckClassified += 1
+    if (rangeReversalLong and longSignal) or (rangeReversalShort and shortSignal)
+        wyckEntered += 1
+    else
+        string r = rangeReversalLong ? noBuyReason : noSellReason
+        wyckLastBlock := r == "" ? "Grade or score gate" : r
 
 // Prefer higher score if both fire same bar
 if longSignal and shortSignal
@@ -1533,7 +1549,7 @@ bgcolor(marketRegime == "STRONG_BULL" ? color.new(color.green, 92) : marketRegim
 // 18. DASHBOARD
 // =============================================================================
 
-var table dash = table.new(position.top_right, 2, 22, bgcolor=color.new(color.black, 75), border_width=1)
+var table dash = table.new(position.top_right, 2, 24, bgcolor=color.new(color.black, 75), border_width=1)
 
 if showDash and barstate.islast
     table.cell(dash, 0, 0, "Metric", text_color=color.gray, text_size=size.small)
@@ -1581,6 +1597,10 @@ if showDash and barstate.islast
         table.cell(dash, 1, 20, noSellReason == "" ? "OK" : noSellReason, text_color=color.olive, text_size=size.tiny)
         table.cell(dash, 0, 21, "Scores", text_color=color.olive, text_size=size.tiny)
         table.cell(dash, 1, 21, "VSA B/S " + str.tostring(vsaBuyScore, "#") + "/" + str.tostring(vsaSellScore, "#") + " VCP " + str.tostring(vcpScore), text_color=color.olive, text_size=size.tiny)
+        table.cell(dash, 0, 22, "Wyckoff cls/ent", text_color=color.aqua, text_size=size.tiny)
+        table.cell(dash, 1, 22, str.tostring(wyckClassified) + " / " + str.tostring(wyckEntered), text_color=color.aqua, text_size=size.tiny)
+        table.cell(dash, 0, 23, "Wyck last block", text_color=color.aqua, text_size=size.tiny)
+        table.cell(dash, 1, 23, wyckLastBlock, text_color=color.aqua, text_size=size.tiny)
 
 // Debug labels
 if debugMode and signalBar and not longSignal and buyScore >= watchScoreMin and noBuyReason != ""
